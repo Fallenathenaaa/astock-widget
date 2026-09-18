@@ -19,6 +19,11 @@ venv/
 _*.py
 _*.png
 
+# 工具产出的报告（自动生成，且会罗列内部文件名）
+tools/size_report.md
+tools/usage_report.csv
+tools/usage_report.json
+
 # 系统
 Thumbs.db
 desktop.ini

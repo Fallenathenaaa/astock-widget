@@ -55,7 +55,7 @@ def get_token():
 
     token 明文写在 remote URL（也就是 .git/config）里不算进版本库，
     但终究是明文，所以推荐走环境变量：
-        export GH_TOKEN=ghp_xxx && python tools/push_github.py
+        export GH_TOKEN=<你的 token> && python tools/push_github.py
     """
     env = os.environ.get("GH_TOKEN", "").strip()
     if env:
