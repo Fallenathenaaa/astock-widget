@@ -1,0 +1,25 @@
+# 个人配置：含自选股和持仓成本，不要提交
+stocks.json
+*.bak
+*.bak[0-9]*
+backups/
+logs/
+
+# 本地笔记：写了解锁隐藏菜单的方法，不对外
+LOCAL-NOTES.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.venv/
+venv/
+
+# 临时截图 / 调试脚本
+_*.py
+_*.png
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
