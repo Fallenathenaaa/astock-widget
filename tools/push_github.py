@@ -51,9 +51,18 @@ def http(method, path, body=None, token=""):
 
 
 def get_token():
+    """优先读环境变量 GH_TOKEN，其次才从 remote URL 里抠。
+
+    token 明文写在 remote URL（也就是 .git/config）里不算进版本库，
+    但终究是明文，所以推荐走环境变量：
+        export GH_TOKEN=ghp_xxx && python tools/push_github.py
+    """
+    env = os.environ.get("GH_TOKEN", "").strip()
+    if env:
+        return env
     out = subprocess.check_output(["git", "remote", "get-url", "origin"]).decode().strip()
     if "@" not in out:
-        sys.exit("remote URL 不带 token")
+        sys.exit("没有 GH_TOKEN，且 remote URL 不带 token")
     return out.split("//", 1)[1].split("@", 1)[0]
 
 
