@@ -2600,7 +2600,10 @@ class Ticker(QWidget):
         contextMenuEvent 又弹一次。右键逻辑全部收在这里。
         """
         pos = e.globalPosition().toPoint() if hasattr(e, "globalPosition") else e.globalPos()
-        lx, ly = self._logic_pos(e)
+        # QContextMenuEvent 没有 position()/localPos()（那是 QMouseEvent 的 API），
+        # 只有 pos()（QPoint, 整数坐标）。直接用，不走 _logic_pos。
+        local = e.pos()
+        lx, ly = local.x() / self.scale, local.y() / self.scale
         kind, idx = self.hit_test(lx, ly)
         if self.sel_mode:
             self.exit_sel_mode()          # 多选态下右键 = 取消
