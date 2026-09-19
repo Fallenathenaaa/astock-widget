@@ -29,7 +29,7 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
-from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QRect, QPointF,
+from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QRect, QPointF, QPoint,
                             QLineF, QTimer, QEvent, QAbstractNativeEventFilter)
 from PySide6.QtGui import (
     QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QIcon, QFontMetrics, QImage,
@@ -1274,6 +1274,36 @@ class Searcher(QThread):
 
 
 # ---------------- 主窗口 ----------------
+def _event_local(e):
+    """事件的窗口内坐标 -> QPointF。
+
+    Qt 6 的不同事件类型给的东西不一样，PySide6 小版本之间也有出入：
+      · QMouseEvent        -> position()  (QPointF)
+      · QContextMenuEvent  -> pos()       (QPoint)  —— 没有 position/localPos
+      · 早期 Qt 5 写法      -> localPos()  (QPointF)
+    以前这里写的是 `e.position() if hasattr(...) else e.localPos()`，
+    QContextMenuEvent 两个都没有，一右键就 AttributeError。逐级 fallback，
+    最后退到 (0, 0)：取不到坐标顶多是点不中，不该让整个挂件崩掉。
+    """
+    for name in ("position", "localPos", "pos"):
+        fn = getattr(e, name, None)
+        if callable(fn):
+            p = fn()
+            # QPoint 和 QPointF 都有 x()/y()，显式取值比 QPointF(QPoint) 稳
+            return p if isinstance(p, QPointF) else QPointF(p.x(), p.y())
+    return QPointF()
+
+
+def _event_global(e):
+    """事件的屏幕坐标 -> QPoint。globalPosition() / globalPos() 两路都试，理由同上。"""
+    for name in ("globalPosition", "globalPos"):
+        fn = getattr(e, name, None)
+        if callable(fn):
+            p = fn()
+            return p.toPoint() if isinstance(p, QPointF) else QPoint(p.x(), p.y())
+    return QPoint()
+
+
 class Ticker(QWidget):
     # ---- 多选删除 ----
     def _init_sel_mode(self):
@@ -2371,7 +2401,7 @@ class Ticker(QWidget):
     # ---- 多选删除：命中测试 ----
     def _logic_pos(self, e):
         """鼠标事件坐标 -> 逻辑坐标（paintEvent 里做过 p.scale，所以要除回去）"""
-        lp = e.position() if hasattr(e, "position") else e.localPos()
+        lp = _event_local(e)
         return lp.x() / self.scale, lp.y() / self.scale
 
     def hit_test(self, lx, ly):
@@ -2476,8 +2506,8 @@ class Ticker(QWidget):
                 return
             # 普通模式：记下按下点，长按 450ms 进多选；移动超过阈值则当拖窗口
             if not self.cfg.get("locked"):
-                self.drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            self._press_pos = e.globalPosition().toPoint()
+                self.drag_pos = _event_global(e) - self.frameGeometry().topLeft()
+            self._press_pos = _event_global(e)
             self._press_row = idx if kind == "row" else None
             self._moved = False
             if self._press_row is not None:
@@ -2488,20 +2518,20 @@ class Ticker(QWidget):
         if self.drag_pos and e.buttons() & Qt.LeftButton:
             # 移动超过阈值就认定是拖窗口，取消长按
             if self._press_pos is not None:
-                d = e.globalPosition().toPoint() - self._press_pos
+                d = _event_global(e) - self._press_pos
                 if abs(d.x()) > 5 or abs(d.y()) > 5:
                     if not self._moved:
                         self._moved = True
                         self._long_timer.stop()
-            raw = e.globalPosition().toPoint() - self.drag_pos
-            self.move(*self.snap_pos(raw.x(), raw.y(), e.globalPosition().toPoint()))
+            raw = _event_global(e) - self.drag_pos
+            self.move(*self.snap_pos(raw.x(), raw.y(), _event_global(e)))
             e.accept()
 
     def mouseReleaseEvent(self, e):
         self._long_timer.stop()
         if self.drag_pos:
             self.move(*self.snap_pos(self.x(), self.y(),
-                                     e.globalPosition().toPoint()))  # 松手再吸一次，保证落位
+                                     _event_global(e)))  # 松手再吸一次，保证落位
             self.cfg["pos"] = [self.x(), self.y()]
             save_config(self.cfg)
             # 拖到新位置，壁纸可能不一样了 —— 重采一次
@@ -2599,11 +2629,8 @@ class Ticker(QWidget):
         mousePressEvent 里以前也处理了一次右键：按下弹一次、抬起时 Qt 再发
         contextMenuEvent 又弹一次。右键逻辑全部收在这里。
         """
-        pos = e.globalPosition().toPoint() if hasattr(e, "globalPosition") else e.globalPos()
-        # QContextMenuEvent 没有 position()/localPos()（那是 QMouseEvent 的 API），
-        # 只有 pos()（QPoint, 整数坐标）。直接用，不走 _logic_pos。
-        local = e.pos()
-        lx, ly = local.x() / self.scale, local.y() / self.scale
+        pos = _event_global(e)
+        lx, ly = self._logic_pos(e)
         kind, idx = self.hit_test(lx, ly)
         if self.sel_mode:
             self.exit_sel_mode()          # 多选态下右键 = 取消
@@ -2615,7 +2642,7 @@ class Ticker(QWidget):
             self.show_menu(pos)
 
     def mouseDoubleClickEvent(self, e):
-        self.show_menu(e.globalPosition().toPoint())
+        self.show_menu(_event_global(e))
 
     def show_row_menu(self, pos, idx):
         """在某只股票上右键：直接给出针对这一只的操作"""
@@ -3135,20 +3162,26 @@ def save_shot(widget, path):
     print("SHOT_SAVED", path)
 
 
-_singleton_locked = False   # 模块级：本进程是否已持有 mutex
+SINGLETON_MUTEX = "Local\\AStockWidget-Singleton-v1"
+
+_held_mutexes = set()   # 模块级：本进程已经持有的 mutex 名字
 
 
-def _singleton_check():
+def _singleton_check(name=None):
     """Windows 命名 mutex 单实例检测。
     已在运行 → True。没在运行 → False。
+
+    name 留空 = 挂件正式名；测试传自己的名字，免得和本机正在跑的挂件互相
+    干扰 —— 一边开着挂件一边跑测试是常事，用正式名的话"没人占着"那两条
+    断言会被真挂件顶掉，红得很随机。
 
     CreateMutexW 返回的 handle **必须保留到进程结束**，不能 CloseHandle，
     否则 mutex 对象会销毁，下次同名 CreateMutexW 会"成功创建"。
     """
-    global _singleton_locked
+    name = name or SINGLETON_MUTEX
     if sys.platform != "win32":
         return False
-    if _singleton_locked:                # 本进程已持有，再调只会看到自己（永远 False）
+    if name in _held_mutexes:            # 本进程已持有，再调只会看到自己（永远 False）
         return False
     u32 = ctypes.windll.user32
     k32 = ctypes.windll.kernel32
@@ -3156,10 +3189,16 @@ def _singleton_check():
     u32.MessageBoxW.restype  = wintypes.INT
     k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
     k32.CreateMutexW.restype  = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype  = wintypes.BOOL
+    k32.SetLastError.argtypes = [wintypes.DWORD]
     k32.GetLastError.argtypes = []
     k32.GetLastError.restype  = wintypes.DWORD
 
-    h = k32.CreateMutexW(None, False, "Local\\AStockWidget-Singleton-v1")
+    # GetLastError 只在"刚失败的那个调用之后"才有意义。CreateMutexW 成功时
+    # 不保证把它清零 —— 先归零，免得读到上一次残留的 183 而误报"已在运行"。
+    k32.SetLastError(0)
+    h = k32.CreateMutexW(None, False, name)
     if h:
         err = k32.GetLastError()
         if err == 183:                       # ERROR_ALREADY_EXISTS
@@ -3167,7 +3206,7 @@ def _singleton_check():
             # 引用计数，别人退出后 mutex 也不销毁，下次启动就永远是"已在运行"。
             k32.CloseHandle(h)
             return True
-        _singleton_locked = True             # 本进程持 mutex 到退出（handle 不 Close）
+        _held_mutexes.add(name)              # 本进程持 mutex 到退出（handle 不 Close）
     return False
 
 

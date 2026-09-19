@@ -238,19 +238,24 @@ else:
 print("== 单实例 ==")
 # 不能靠"碰巧有挂件在跑"来测 —— 没人跑的时候这个用例会假失败。
 # 改成显式起一个子进程占住 mutex，模拟"已经有一个实例了"。
+#
+# 名字必须用本进程私有的：用正式名的话，用户一边开着挂件一边跑测试时，
+# 真挂件会一直占着那个 mutex，"别人退出后 → 本进程能拿到锁"这两条就必然红，
+# 而且只在这台机器上红 —— 典型的"环境一变就随机失败"。
 import subprocess  # noqa: E402
 import ctypes  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
+_MUTEX = "Local\\AStockWidget-Test-%d" % os.getpid()
+
 _holder = None
 try:
     _code = ("import ctypes,time;"
-             "ctypes.windll.kernel32.CreateMutexW(None, False,"
-             " 'Local\\\\AStockWidget-Singleton-v1');"
-             "time.sleep(60)")
+             "ctypes.windll.kernel32.CreateMutexW(None, False, %r);"
+             "time.sleep(60)" % _MUTEX)
     _holder = subprocess.Popen([sys.executable, "-c", _code])
     time.sleep(1.0)          # 等子进程把 mutex 建好
-    chk("别人占着 mutex → 检测到已有实例", W._singleton_check() is True)
+    chk("别人占着 mutex → 检测到已有实例", W._singleton_check(_MUTEX) is True)
 finally:
     if _holder is not None:
         _holder.terminate()
@@ -260,8 +265,10 @@ finally:
             _holder.kill()
     time.sleep(0.5)          # 等内核把 mutex 收回去
 
-chk("别人退出后 → 本进程能拿到锁", W._singleton_check() is False)
-chk("进程内二次调用不误报自己", W._singleton_check() is False)
+chk("别人退出后 → 本进程能拿到锁", W._singleton_check(_MUTEX) is False)
+chk("进程内二次调用不误报自己", W._singleton_check(_MUTEX) is False)
+chk("默认用的是挂件正式名", W.SINGLETON_MUTEX == "Local\\AStockWidget-Singleton-v1",
+    W.SINGLETON_MUTEX)
 
 print("== 备份 ==")
 p = W.snapshot_config(force=True)
