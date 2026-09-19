@@ -34,3 +34,6 @@ tools/usage_report.json
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Release 正文草稿（本机用，不入库）
+.release_body.md
