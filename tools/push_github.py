@@ -77,7 +77,11 @@ def http(method, path, body=None, token="", retries=3):
             req.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(req, data, timeout=60) as r:
-                return r.status, json.loads(r.read().decode("utf-8"))
+                # 204 No Content 的 body 是空的（删 ref 就是），直接 json.loads("")
+                # 会抛 JSONDecodeError —— 那会被下面的 except 当成网络抖动，
+                # 于是同一个 DELETE 又发一遍，第二次因为 ref 已经没了拿 422。
+                raw = r.read().decode("utf-8")
+                return r.status, (json.loads(raw) if raw.strip() else {})
         except urllib.error.HTTPError as e:
             try:
                 payload = json.loads(e.read().decode("utf-8"))
