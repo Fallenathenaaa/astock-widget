@@ -1,0 +1,17 @@
+# A股桌面盯盘挂件 —— 运行依赖
+#
+# 只有一个：PySide6（Qt 的 Python 绑定，负责窗口 / 绘制 / 托盘）。
+# 版本号钉死：PySide6 6.x 各小版本间有行为差异（托盘图标、高分屏缩放），
+# 浮动版本会让"在我机器上好好的"变成常态。
+#
+# 安装：
+#     python -m venv .venv
+#     .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# 国内慢的话加镜像：
+#     .venv\Scripts\python.exe -m pip install -r requirements.txt ^
+#         -i https://mirrors.aliyun.com/pypi/simple/
+#
+# Python 版本：3.10 ~ 3.14（3.9 及以下没有 PySide6 6.11 的 wheel）
+
+PySide6==6.11.2

@@ -1,0 +1,44 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # 挂件是 Windows 专用（托盘、全局热键、注册表自启都用 Win32 API），
+    # 所以 CI 也跑 windows-latest，和真实使用环境一致。
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 是 requirements.txt 里写的下限，3.13 是当前主流版本
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        # requirements.txt 里有 PySide6，但测试要跑在 offscreen 上，
+        # 多加一个 PyQt 不需要的东西没意义，这里直接装文件里写的版本。
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile check
+        run: python -m compileall -q widget.py providers.py market_clock.py run_tests.py tests
+
+      - name: Run tests
+        # 全程 offscreen，不需要显示器。任何一项失败都会让整个 job 红掉。
+        run: python run_tests.py
+
+      - name: Release hygiene
+        run: python tools/release_check.py

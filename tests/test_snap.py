@@ -25,19 +25,27 @@ def chk(n, c, x=""):
         print("  FAIL  %s   %s" % (n, x))
 
 
+import copy  # noqa: E402
+import json  # noqa: E402
+
 tmp = tempfile.mkdtemp(prefix="astock-snap-")
 real_cfg = os.path.join(os.path.dirname(os.path.abspath(W.__file__)), "stocks.json")
-with io.open(real_cfg, encoding="utf-8") as f:
-    REAL = f.read()
+# 不读真实配置：干净 clone 里没有 stocks.json，读了就假失败
+REAL = None
+if os.path.exists(real_cfg):
+    with io.open(real_cfg, encoding="utf-8") as f:
+        REAL = f.read()
 W.CONFIG_PATH = os.path.join(tmp, "stocks.json")
-with io.open(W.CONFIG_PATH, "w", encoding="utf-8") as f:
-    f.write(REAL)
 
 app = QApplication([])
 W.Fetcher.start = lambda self: None    # 同上：别让线程在退出时把进程 abort 掉
 W.Searcher.start = lambda self: None
-cfg = dict(W.DEFAULT_CONFIG)
+# 深拷贝：DEFAULT_CONFIG 里有 positions / codes 这种可变子对象，浅拷贝会
+# 让测试里的改动漏到全局默认上，污染同一进程里后面的用例
+cfg = copy.deepcopy(W.DEFAULT_CONFIG)
 cfg["snap"] = True
+with io.open(W.CONFIG_PATH, "w", encoding="utf-8") as f:
+    f.write(json.dumps(cfg, ensure_ascii=False, indent=2))
 w = W.Ticker(cfg)
 W.Fetcher.start = lambda self: None
 
@@ -102,7 +110,10 @@ with io.open(W.CONFIG_PATH, encoding="utf-8") as f:
     chk("写进配置文件", json.load(f).get("snap") is True)
 
 print("== 7. 真实配置未被改动 ==")
-chk("真实 stocks.json 原样", io.open(real_cfg, encoding="utf-8").read() == REAL)
+if REAL is None:
+    print("  SKIP  本机没有 stocks.json（干净 checkout 的正常状态）")
+else:
+    chk("真实 stocks.json 原样", io.open(real_cfg, encoding="utf-8").read() == REAL)
 
 print("\n%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

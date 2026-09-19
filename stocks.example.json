@@ -1,16 +1,21 @@
 {
   "title": "A股盯盘",
   "show_index": true,
+  "ui_scale": 1.0,
   "alert_pct": 3.0,
-  "codes": ["sh600519", "sz000001", "sz300750"],
+  "effect_pct": 3.0,
   "positions": {},
+  "codes": ["sh600519", "sz000001", "sz300750"],
   "interval": 3,
   "bg_alpha": 190,
-  "ui_scale": 1.0,
   "locked": false,
   "spark": true,
   "click_through": false,
   "always_on_top": true,
   "autostart": false,
-  "pos": null
+  "unlocked": false,
+  "snap": true,
+  "pos": null,
+  "data_source": "auto",
+  "boss_key": "Ctrl+Alt+H"
 }

@@ -112,7 +112,10 @@ chk("save_config 触发快照", len(W.list_snapshots()) == n0 + 1, str(len(W.lis
 
 print("== 11. 真实配置没被碰 ==")
 real = os.path.join(os.path.dirname(os.path.abspath(W.__file__)), "stocks.json")
-chk("真实 stocks.json 仍在", os.path.exists(real))
+if os.path.exists(real):
+    chk("真实 stocks.json 仍在", True)
+else:
+    print("  SKIP  本机没有 stocks.json（干净 checkout 的正常状态）")
 real_bak = os.path.join(os.path.dirname(real), "backups")
 _before = set(os.listdir(real_bak)) if os.path.isdir(real_bak) else set()
 chk("真实 backups/ 未被测试新增文件",

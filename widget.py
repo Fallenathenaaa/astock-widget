@@ -3,20 +3,18 @@
 A股桌面盯盘挂件 (Windows 11)
 - 无边框 / 半透明 / 置顶 / 可拖动
 - 最多 5 只股票，红涨绿跌，含分时迷你走势
-- 数据源：腾讯财经行情接口（免费、无需 Key）
+- 数据源：腾讯 / 新浪行情接口（免费、无需 Key），主源挂了自动切备源
 """
+import io
+import glob
 import json
 import math
 import os
 import re
+import shutil
 import sys
 import time
-import urllib.parse
-import urllib.request
-import urllib.error
-import io
-import glob
-import shutil
+import copy
 import ctypes
 import traceback
 import threading
@@ -24,7 +22,7 @@ from ctypes import wintypes
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QRect, QPointF,
-                            QLineF, QTimer, QEvent)
+                            QLineF, QTimer, QEvent, QAbstractNativeEventFilter)
 from PySide6.QtGui import (
     QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QIcon, QFontMetrics, QImage,
     QPalette, QLinearGradient, QRadialGradient,
@@ -34,8 +32,12 @@ from PySide6.QtWidgets import (
     QLineEdit, QListWidget, QListWidgetItem,
 )
 
+import market_clock
+import providers
+from providers import HALT, LIMIT_UP, LIMIT_DN
+
 APP_NAME = "A股桌面盯盘挂件"
-APP_VERSION = "v2.0.1"
+APP_VERSION = "v2.1.0"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "stocks.json")
@@ -50,8 +52,6 @@ BACKUP_PREFIX = "stocks-"   # 快照文件名前缀：stocks-20260918-142530.jso
 LOG_DIR = os.path.join(APP_DIR, "logs")
 LOG_KEEP = 10               # 最多保留的崩溃日志份数
 LOG_PREFIX = "crash-"
-
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 # ---------------- 配色 ----------------
 BG = (16, 17, 22)
@@ -259,22 +259,23 @@ def festival_trigger_days(f, year):
 _fest_cache = {}
 
 
-def active_festival(cfg=None, today=None):
+def active_festival(today=None, forced=None):
     """今天生效的节日 —— 有且只有一个。
 
-    测试开关优先级最高（多个同时开时按 pri 取第一个），否则看触发日。
-    结果按 (今天, 开关组合) 缓存：这个函数每秒会被调几十次。
+    forced 是运行时强制开启的节日 key，**不写进配置**：以前存进 stocks.json，
+    崩溃 / 任务管理器结束 / 断电都不会走 quit()，下次启动就还挂着强制特效，
+    和"严格按日期触发"的说法对不上。
+
+    结果按 (今天, forced) 缓存：这个函数每秒会被调几十次。
     """
-    cfg = cfg or {}
-    today = today or datetime.now().date()
-    tests = tuple(f["key"] for f in FESTIVALS if cfg.get(f["key"] + "_test"))
-    ck = (today, tests)
+    today = today or market_clock.market_now().date()
+    ck = (today, forced or "")
     if ck in _fest_cache:
         k = _fest_cache[ck]
         return FEST_BY_KEY.get(k) if k else None
     hit = None
-    if tests:
-        hit = FEST_BY_KEY[tests[0]]       # FESTIVALS 已按 pri 降序
+    if forced and forced in FEST_BY_KEY:
+        hit = FEST_BY_KEY[forced]
     else:
         for f in FESTIVALS:
             if today in festival_trigger_days(f, today.year):
@@ -288,7 +289,7 @@ def active_festival(cfg=None, today=None):
 
 def next_festival(today=None, within=400):
     """下一个会触发的节日 (festival, date)，用于菜单提示。没有返回 None。"""
-    today = today or datetime.now().date()
+    today = today or market_clock.market_now().date()
     best = None
     years = sorted({today.year, (today + timedelta(days=within)).year})
     for f in FESTIVALS:
@@ -537,11 +538,12 @@ IDX_H = 20
 ROW_H = 46
 FOOTER_H = 18
 
-EFFECT_SECONDS = 180   # 收盘彩蛋持续时间：3 分钟
-EFFECT_MINUTE = (14, 57)   # 触发时刻：14:57 集合竞价
+EFFECT_SECONDS = 180   # 收盘彩蛋持续时间：3 分钟（触发窗口见 market_clock.CLOSING_CALL）
+ALERT_REARM_GAP = 0.3  # 异动提醒：回落到 (阈值 - 0.3)% 以下才重新武装，防边界抖动反复弹
 
 IDLE_TICK_MS = 500     # 平时心跳：2fps，只用来倒计时 pulse / 清理过期状态
 ANIM_TICK_MS = 50      # 有动画时的心跳：20fps（飘落物 / 火焰 / 冰霜）
+SEARCH_DEBOUNCE_MS = 300   # 搜索防抖：停手 300ms 才发请求，别一个字一次
                        # 40ms(25fps) 和 20fps 肉眼几乎无差，但唤醒次数少 20%
 
 SNAP_MARGIN = 16       # 拖到距屏幕边缘这么多像素内就吸附上去（0 = 关）
@@ -560,6 +562,10 @@ DOT_TAP_N = 5
 INDEX_CODES = ["sh000001", "sz399001", "sz399006"]   # 上证 / 深证 / 创业板
 INDEX_NAMES_LIST = ["上证", "深证", "创业板"]   # 按 INDEX_CODES 顺序；注意 sh000001 与 sz000001 返回的 code 都是 000001，只能按位置区分
 
+DEFAULT_BOSS_KEY = "Ctrl+Alt+H"     # 老板键默认值（一键隐藏/恢复）
+BOSS_KEY_PRESETS = ["", DEFAULT_BOSS_KEY, "Ctrl+Alt+`",
+                    "Ctrl+Shift+H", "Ctrl+Alt+Q", "F9"]   # 菜单里的几个常用组合，空串 = 关闭
+
 DEFAULT_CONFIG = {
     "title": "A股盯盘",
     "show_index": True,
@@ -575,34 +581,113 @@ DEFAULT_CONFIG = {
     "click_through": False,
     "always_on_top": True,
     "autostart": False,
-    # 每个节日一个「强制开启」开关，由 FESTIVALS 表自动生成（加节日不用改这里）
-    **{f["key"] + "_test": False for f in FESTIVALS},
+    # 注意：节日「强制开启」是 runtime-only（self._forced_festival），**不进配置**。
+    # 存过一次就可能在崩溃后残留，与"严格按日期触发"冲突。
     "unlocked": False,          # 隐藏菜单是否已解锁（输对一次口令后记住，免得每次重启重输）
     "snap": True,               # 拖动时吸附到屏幕边缘
     "pos": None,
+    "data_source": "auto",      # 行情数据源："auto" = 主源挂了自动换备源
+    "boss_key": DEFAULT_BOSS_KEY,   # 老板键：一键隐藏/恢复，空串 = 关闭
+}
+
+# 只能取这几个值的字段：写进配置文件里别的数一律退回默认
+CONFIG_CHOICES = {
+    "interval": (1, 3, 5, 10, 30),
+    "ui_scale": (0.85, 1.0, 1.15, 1.3),
 }
 
 
 # ---------------- 工具 ----------------
+def validate_config(raw):
+    """把读进来的配置按 DEFAULT_CONFIG 逐项校验。
+
+    JSON 能解析不等于能用：手工改过的 stocks.json 里可能有
+    `"interval": -1` / `"ui_scale": "abc"` / `"codes": "sh600519"`，
+    以前这些会一路带到 UI 上，轻则排版错乱、重则绘制时抛异常。
+
+    规则：类型不对、超出取值范围、不在可选集合里 → 一律退回默认值，
+    不抛异常、不打断启动。配置文件里没有的键（历史遗留）直接丢掉。
+    """
+    d = raw if isinstance(raw, dict) else {}
+    out = copy.deepcopy(DEFAULT_CONFIG)
+    for key, default in DEFAULT_CONFIG.items():
+        if key not in d:
+            continue
+        v = d[key]
+        try:
+            if isinstance(default, bool):
+                out[key] = bool(v)
+            elif isinstance(default, (int, float)):
+                num = float(v)
+                if num != num:                       # NaN
+                    continue
+                out[key] = int(num) if isinstance(default, int) else num
+            elif isinstance(default, str):
+                out[key] = str(v)[:12] if key == "title" else str(v)
+            elif isinstance(default, list):
+                # 只收字符串：str(x) 会把 None 变成字面量 "None"，那是纯垃圾
+                out[key] = ([x for x in v if isinstance(x, str)][:5]
+                            if isinstance(v, (list, tuple)) else list(default))
+            elif isinstance(default, dict):
+                # 必须 deepcopy：直接把入参那个 dict 接过来，调用方后续改它
+                # 就会改到 DEFAULT_CONFIG 上，污染整个进程
+                out[key] = copy.deepcopy(v) if isinstance(v, dict) else {}
+            elif default is None:
+                out[key] = v                          # pos：值要么是 [x, y] 要么是 None，下面再验
+        except (TypeError, ValueError):
+            continue                                  # 认不出来就用默认的
+    # 取值范围 / 可选集合二次收紧
+    out["bg_alpha"] = min(255, max(0, int(out.get("bg_alpha", 190))))
+    out["alert_pct"] = max(0.0, float(out.get("alert_pct") or 0))
+    out["effect_pct"] = max(0.0, float(out.get("effect_pct") or 0))
+    for key, choices in CONFIG_CHOICES.items():
+        if out.get(key) not in choices:
+            out[key] = DEFAULT_CONFIG[key]
+    pos = out.get("pos")
+    if pos is not None:
+        ok = (isinstance(pos, (list, tuple)) and len(pos) == 2
+              and all(isinstance(x, (int, float)) for x in pos))
+        out["pos"] = [int(pos[0]), int(pos[1])] if ok else None
+    codes = out.get("codes")
+    if isinstance(codes, list):
+        # 空串和 None 也得剔掉：上面 str(x) 会把 None 变成字面量 "None"
+        out["codes"] = [c for c in dict.fromkeys(codes)
+                        if isinstance(c, str) and c.strip()][:5]
+    return out
+
+
 def load_config():
-    cfg = dict(DEFAULT_CONFIG)
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
     if not os.path.exists(CONFIG_PATH):
         return cfg                    # 全新安装：别去翻旧备份
+    raw = None
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
-        return cfg
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            cfg.update(validate_config(raw))
+            return cfg
     except Exception:
         pass                          # 文件在但读不出来：试着从备份捞
     saved = recover_from_snapshot()
     return saved if saved is not None else cfg
 
 
+def atomic_write_text(path, text):
+    """先写临时文件再 os.replace —— 写一半断电不会留下半个 stocks.json。"""
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def save_config(cfg):
     try:
         snapshot_config()          # 先把「改动前」这份存下来，写完就晚了
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        atomic_write_text(CONFIG_PATH,
+                          json.dumps(cfg, ensure_ascii=False, indent=2))
     except Exception:
         pass
 
@@ -635,8 +720,9 @@ def recover_from_snapshot():
         except Exception:
             continue                  # 这份也是坏的，换下一份
         if isinstance(d, dict):
-            cfg = dict(DEFAULT_CONFIG)
-            cfg.update(d)
+            # 一样要走 validate_config：快照是历史文件，里面可能是当年
+            # 手改过的脏值（interval=-1、ui_scale="abc"），直接 update 会带进 UI
+            cfg = validate_config(d)
             _recovered_from = p
             return cfg
     return None
@@ -741,8 +827,7 @@ def restore_snapshot(path):
             return False
         json.loads(text)                 # 先确认是合法 JSON，别把配置写坏
         snapshot_config(force=True)      # 覆盖前留一份当前的
-        with io.open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            f.write(text)
+        atomic_write_text(CONFIG_PATH, text)   # 写一半断电不能留下半个 stocks.json
         return True
     except Exception:
         return False
@@ -831,27 +916,46 @@ def install_crash_handler():
 
 
 def normalize_code(raw):
-    """600519 / sh600519 / 600519.SH / 000001 -> sh600519"""
-    s = str(raw).strip().lower().replace(" ", "")
+    """把各种写法归一成 sh600519 这种带市场的完整代码。认不出来返回 None。
+
+    必须严格：以前先把 "000001.SH" 的 ".SH" 截掉，剩下的 000001 就被当成
+    深市平安银行了 —— 交易所后缀是最明确的信号，得最先认。
+
+    **最后一道关是 providers.symbol_kind()**：这个产品只做沪深京 A 股 / 指数 /
+    ETF，B 股（沪 900xxx / 深 200xxx）、可转债（沪 11xxxx / 深 12xxxx）、
+    场外基金都不在范围里。让 normalize_code 和搜索过滤共用同一套白名单 ——
+    否则会出现"搜索不给你选，但手输代码能加进去"的裂缝。
+    """
+    s = str(raw).strip().lower().replace(" ", "").replace("_", "")
     if not s:
         return None
-    if "." in s:
-        s = s.split(".")[0]
-    if s.startswith(("sh", "sz", "bj")) and len(s) == 8:
-        return s
-    s = "".join(ch for ch in s if ch.isdigit() or ch in "shzjbj")
-    s = s.lstrip("shzjbj") if not s[:2] in ("sh", "sz", "bj") else s
-    if s.startswith(("sh", "sz", "bj")):
-        return s
-    if not s.isdigit():
-        return None
-    if s.startswith(("60", "68", "90", "51", "58", "56", "11", "50")):
-        return "sh" + s
-    if s.startswith(("00", "30", "20", "12", "15", "16", "18")):
-        return "sz" + s
-    if s.startswith(("43", "83", "87", "88", "92", "82")):
-        return "bj" + s
-    return "sh" + s
+    # 1) 显式交易所后缀：600519.SH / 600519.SS / 000001.SZ
+    m = re.fullmatch(r"(\d{6})\.(sh|ss|sz|bj)", s)
+    if m:
+        code, mk = m.group(1), ("sh" if m.group(2) == "ss" else m.group(2))
+        return _accept(mk + code)
+    # 2) 已经是带市场的写法：sh600519
+    m = re.fullmatch(r"(sh|sz|bj)(\d{6})", s)
+    if m:
+        return _accept(m.group(1) + m.group(2))
+    # 3) 纯 6 位数字，按代码段推断市场
+    if not re.fullmatch(r"\d{6}", s):
+        return None                      # 位数不对 / 夹字母，一律不猜
+    if s == "000000":
+        return None                      # 全 0 不是代码，多半是空值被格式化出来的
+    if s.startswith(("60", "68", "90", "51", "52", "56", "58", "50", "11")):
+        return _accept("sh" + s)
+    if s.startswith(("000", "001", "002", "003", "300", "301", "399",
+                     "200", "12", "15", "16", "18")):
+        return _accept("sz" + s)
+    if s.startswith(("43", "83", "87", "88", "92", "82", "899")):
+        return _accept("bj" + s)
+    return None
+
+
+def _accept(full):
+    """推断出完整代码后再过一遍品种白名单，不在范围里就当没认出来。"""
+    return full if providers.symbol_kind(full) else None
 
 
 def parse_positions(text):
@@ -879,142 +983,143 @@ def parse_positions(text):
     return pos
 
 
-def http_get(url, timeout=5):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+# ---------------- 老板键（全局热键） ----------------
+WM_HOTKEY = 0x0312
+HOTKEY_ID = 0xA571          # 自己挑的 id，只在本进程内有效
+
+MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x0001, 0x0002, 0x0004, 0x0008
+
+_MODS = {"alt": MOD_ALT, "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
+         "shift": MOD_SHIFT, "win": MOD_WIN}
+# 字母数字直接取 ASCII 当虚拟键码，其余常用键查这张表
+_VKS = {"space": 0x20, "enter": 0x0D, "tab": 0x09, "esc": 0x1B,
+        "`": 0xC0, "-": 0xBD, "=": 0xBB, "[": 0xDB, "]": 0xDD,
+        "\\": 0xDC, ";": 0xBA, "'": 0xDE, ",": 0xBC, ".": 0xBE, "/": 0xBF}
+_VKS.update({("f%d" % n): 0x6F + n for n in range(1, 25)})
+
+def parse_hotkey(spec):
+    """'Ctrl+Alt+H' -> (修饰键, 虚拟键码)。认不出来返回 (0, 0)。"""
+    parts = [p.strip().lower() for p in (spec or "").split("+") if p.strip()]
+    if not parts:
+        return 0, 0
+    mod = 0
+    for p in parts[:-1]:
+        if p not in _MODS:
+            return 0, 0
+        mod |= _MODS[p]
+    key = parts[-1]
+    if not mod:
+        # 不带修饰键时只放行 F1-F24 —— 光一个字母/数字太容易误触
+        vk = _VKS.get(key, 0)
+        return (0, vk) if 0x70 <= vk <= 0x87 else (0, 0)
+    vk = _VKS.get(key)
+    if vk is None:
+        # ASCII 字母数字直接拿 ASCII 码当虚拟键码；中文之类的按键认不出来
+        vk = ord(key.upper()) if (len(key) == 1 and key.isascii() and key.isalnum()) else 0
+    return (mod, vk) if vk else (0, 0)
 
 
-def fetch_quotes(codes):
-    """返回行情列表"""
-    if not codes:
-        return []
-    url = "https://qt.gtimg.cn/q=" + ",".join(codes)
-    raw = http_get(url, timeout=5).decode("gbk", errors="ignore")
-    out = []
-    for line in raw.strip().split(";"):
-        line = line.strip()
-        if not line.startswith("v_"):
-            continue
-        body = line[line.find('="') + 2: line.rfind('"')]
-        f = body.split("~")
-        if len(f) < 35:
-            continue
+def hotkey_label(spec):
+    """菜单里显示用的文本"""
+    return spec or "关闭"
+
+
+class HotkeyFilter(QAbstractNativeEventFilter):
+    """接全局热键的 WM_HOTKEY。
+
+    RegisterHotKey 传 NULL 句柄，消息会投到线程消息队列，由 Qt 的原生事件过滤器
+    接住 —— 刻意不绑 HWND：挂件 hide() / setWindowFlags 都会动窗口，绑上去
+    就得不停重新注册，还容易漏。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.callback = None
+        self.registered = None          # 已注册的组合键，None = 没注册
+
+    def register(self, spec):
+        """注册组合键。空串 / 认不出来 = 不注册。返回是否成功。"""
+        self.unregister()
+        mod, vk = parse_hotkey(spec)
+        if not vk:
+            return False
+        u32 = ctypes.windll.user32
+        u32.RegisterHotKey.argtypes = [wintypes.HWND, wintypes.INT,
+                                       wintypes.UINT, wintypes.UINT]
+        u32.RegisterHotKey.restype = wintypes.BOOL
+        if not u32.RegisterHotKey(None, HOTKEY_ID, mod, vk):
+            return False                # 组合键被别的程序占了
+        self.registered = (mod, vk)
+        return True
+
+    def unregister(self):
+        if self.registered is None:
+            return
+        ctypes.windll.user32.UnregisterHotKey(None, HOTKEY_ID)
+        self.registered = None
+
+    def nativeEventFilter(self, event_type, message):
+        name = event_type.decode() if isinstance(event_type, bytes) else event_type
+        if name != "windows_generic_MSG":
+            return False, 0
         try:
-            price = float(f[3])
-            prev = float(f[4])
-            chg = float(f[31])
-            pct = float(f[32])
-        except Exception:
-            continue
-        code = f[2]
-        out.append({
-            "code": code,
-            "name": f[1],
-            "decimals": 3 if code.startswith(("51", "52", "56", "58", "50", "15", "16", "159", "588", "518")) else 2,
-            "price": price,
-            "prev": prev,
-            "change": chg,
-            "pct": pct,
-            "high": f[33],
-            "low": f[34],
-            "open": f[5],
-            "time": f[30],
-        })
-    return out
-
-
-def search_stocks(keyword, limit=8):
-    """搜索股票：支持拼音缩写(mt) / 代码(600519) / 全名(茅台)。
-    腾讯 smartbox，返回格式 v_hint="市场~代码~名称~拼音~类型^..."，无结果为 N"""
-    kw = (keyword or "").strip()
-    if not kw:
-        return []
-    url = "https://smartbox.gtimg.cn/s3/?q=" + urllib.parse.quote(kw) + "&t=all"
-    raw = http_get(url, timeout=5).decode("utf-8", "ignore")
-    m = re.search(r'v_hint="(.*?)"', raw)
-    if not m or m.group(1) == "N":
-        return []
-    body = m.group(1)
-    if "\\u" in body:                      # 接口返回的是 \uXXXX 字面量，需要解码
-        try:
-            body = json.loads('"' + body.replace('"', '\\"') + '"')
-        except Exception:
-            pass
-    out = []
-    for item in body.split("^"):
-        f = item.split("~")
-        if len(f) < 3:
-            continue
-        mk, code, name = f[0], f[1], f[2]
-        if mk not in ("sh", "sz", "bj"):        # 只留沪深京，过滤港股/美股/场外基金
-            continue
-        if not (code.isdigit() and len(code) == 6):
-            continue
-        out.append({
-            "full": mk + code,
-            "code": code,
-            "name": name,
-            "pinyin": f[3] if len(f) > 3 else "",
-            "type": f[4] if len(f) > 4 else "",
-        })
-    return out[:limit]
-
-
-def fetch_spark(code, cache):
-    """分时迷你走势，5 分钟缓存一次；失败返回 None"""
-    now = time.time()
-    hit = cache.get(code)
-    if hit and now - hit[0] < 300:
-        return hit[1]
-    try:
-        url = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=" + code
-        data = json.loads(http_get(url, timeout=5).decode("utf-8", "ignore"))
-        node = data["data"][code]["data"]
-        arr = node["data"] if isinstance(node, dict) else node
-        pts = []
-        for item in arr:
-            p = item.split()
-            if len(p) >= 2:
-                try:
-                    pts.append(float(p[1]))
-                except Exception:
-                    pass
-        if len(pts) < 2:
-            raise ValueError
-        cache[code] = (now, pts)
-        return pts
-    except Exception:
-        return hit[1] if hit else None
-
-
-def is_trading_now():
-    now = datetime.now()
-    if now.weekday() >= 5:
-        return False
-    m = now.hour * 60 + now.minute
-    return (9 * 60 + 15) <= m <= (11 * 60 + 30) or (13 * 60) <= m <= (15 * 60 + 5)
+            msg = wintypes.MSG.from_address(int(message))
+        except (TypeError, ValueError):
+            return False, 0
+        if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+            if self.callback:
+                self.callback()
+            return True, 0
+        return False, 0
 
 
 # ---------------- 数据线程 ----------------
 class Fetcher(QThread):
+    """行情线程。
+
+    GUI 会随时改配置（加/删股票、改刷新间隔），worker 同时也在读 —— 所以可变状态
+    一律放在锁里，每轮取数前拍一份快照，整轮只用快照；emit 时带上 generation，
+    UI 只认当前 generation 的结果，旧结果直接丢。
+    """
     data_ready = Signal(dict)
     failed = Signal(str)
 
+    # HTTP 超时 5 秒，退出时至少等得起一次在途请求（见 WORKER_WAIT_MS）
+    WORKER_WAIT_MS = 6500
+
     def __init__(self):
         super().__init__()
-        self.codes = []
+        self._state_lock = threading.Lock()
+        self._codes = ()
+        self._generation = 0
+        self._stop = False
+        self._fail_count = 0
+        self._spark_cache = {}      # full -> (ts, pts)
+        self._spark_tick = 0
+        # 这些也会在锁里改，读之前一律先快照
         self.show_index = True
         self.fast = 3
         self.slow = 60
-        self._stop = False
-        self._fail_count = 0
-        self._spark_cache = {}
-        self._spark_tick = 0
+        self.source = "auto"        # 数据源偏好："auto" / "tencent" / "sina"
+        self.spark_enabled = True   # 关掉分时后后台就不再拉分时
+
+    # ---- 外部只通过这两个方法改状态 ----
+    def set_codes(self, codes):
+        """换自选股。每换一次 generation +1，让在途的旧行情作废。"""
+        with self._state_lock:
+            self._codes = tuple(codes or ())
+            self._generation += 1
+            self._spark_tick = 0
+            return self._generation
+
+    def set_spark_enabled(self, on):
+        with self._state_lock:
+            self.spark_enabled = bool(on)
+            self._spark_tick = 0    # 重新打开时立刻拉一次
 
     def stop(self):
         self._stop = True
-        self.wait(3000)
+        self.wait(self.WORKER_WAIT_MS)
 
     def run(self):
         """QThread 里冒出去的异常不一定走 sys.excepthook，自己兜一层落盘。"""
@@ -1025,67 +1130,118 @@ class Fetcher(QThread):
 
     def _loop(self):
         while not self._stop:
-            if self.codes:
+            with self._state_lock:
+                codes = list(self._codes)
+                generation = self._generation
+                show_index = self.show_index
+                fast = self.fast
+                source = self.source
+                spark_enabled = self.spark_enabled
+
+            rows = []
+            if codes:
+                rows = self._fetch_rows(codes, source)
+
+            # 指数和自选股分开请求：自选删空了，大盘照样要刷新
+            idx = []
+            if show_index:
                 try:
-                    rows = fetch_quotes(self.codes)
-                    if rows:
-                        self._fail_count = 0
-                        if self._spark_tick <= 0:
-                            for r in rows:
-                                r["spark"] = fetch_spark(self._get_full(r["code"]), self._spark_cache)
-                            self._spark_tick = max(1, int(300 / max(self.fast, 1)))
-                        else:
-                            for r in rows:
-                                r["spark"] = (self._spark_cache.get(self._get_full(r["code"])) or [None, None])[1]
-                        for i, r in enumerate(rows):
-                            if i < len(self.codes):
-                                r["full"] = self.codes[i]      # sh600519 这种完整代码，用于查持仓
-                        idx = []
-                        if self.show_index:
-                            try:
-                                idx = fetch_quotes(INDEX_CODES)
-                            except Exception:
-                                idx = []
-                        self.data_ready.emit({"rows": rows, "idx": idx})
-                    else:
-                        self._fail_count += 1
-                        self.failed.emit("未取到行情")
-                except Exception as e:
-                    self._fail_count += 1
-                    self.failed.emit(str(e))
-                self._spark_tick -= 1
-            interval = self._next_interval()
+                    idx = providers.fetch_quotes(INDEX_CODES, prefer=source)
+                except Exception:
+                    idx = []
+
+            if self._stop:
+                return
+            if rows or idx:
+                self._fill_spark(rows, spark_enabled, fast, source)
+                self.data_ready.emit({"generation": generation,
+                                      "rows": rows, "idx": idx})
+
+            self._spark_tick -= 1
             slept = 0.0
+            interval = self._next_interval(fast)
             while slept < interval and not self._stop:
                 time.sleep(0.25)
                 slept += 0.25
 
-    def _next_interval(self):
+    def _fetch_rows(self, codes, source):
+        try:
+            rows = providers.fetch_quotes(codes, prefer=source)
+        except Exception as e:
+            self._fail_count += 1
+            self.failed.emit(str(e))
+            return []
+        if not rows:
+            self._fail_count += 1
+            self.failed.emit("未取到行情")
+            return []
+        self._fail_count = 0
+        return rows
+
+    def _fill_spark(self, rows, spark_enabled, fast, source):
+        """分时走势填进 rows。关掉分时就不发请求，缓存没过期也不发。"""
+        if not spark_enabled:
+            for r in rows:
+                r["spark"] = None
+            return
+        if self._spark_tick > 0:
+            for r in rows:
+                r["spark"] = (self._spark_cache.get(r.get("full")) or [None, None])[1]
+            return
+        for r in rows:
+            if self._stop:              # 退出时别再一只只地慢慢拉
+                return
+            r["spark"] = self._spark(r.get("full"), source)
+        self._spark_tick = max(1, int(300 / max(fast, 1)))
+
+    def _next_interval(self, fast):
         """连续失败就退避，避免断网时死命重试；恢复成功后自动回到正常频率"""
-        interval = self.fast if is_trading_now() else self.slow
+        interval = fast if market_clock.is_active() else self.slow
         if self._fail_count >= 5:
             interval = max(interval, 30)
         return interval
 
-    def _get_full(self, code):
-        for c in self.codes:
-            if c.endswith(code):
-                return c
-        return normalize_code(code) or code
+    def _spark(self, full, source):
+        """分时走势，5 分钟缓存一次；这次拿不到就先用上次的，还没有才 None"""
+        if not full:
+            return None
+        now = time.time()
+        hit = self._spark_cache.get(full)
+        if hit and now - hit[0] < 300:
+            return hit[1]
+        try:
+            pts = providers.fetch_spark(full, prefer=source)
+            if pts and len(pts) >= 2:
+                self._spark_cache[full] = (now, pts)
+                return pts
+        except Exception:
+            pass
+        return hit[1] if hit else None
 
 
 class Searcher(QThread):
-    """搜索线程：避免输入时卡顿"""
-    result_ready = Signal(list)
+    """搜索线程：避免输入时卡顿。
+
+    每条请求带 (query, seq) 原样带回来。两个请求在途时后回来的那个才是用户想看的，
+    UI 靠 seq 丢弃先发的旧结果 —— 否则"输 mao 再改 pingan"最后会显示 mao。
+    """
+    result_ready = Signal(str, int, list)
+    WORKER_WAIT_MS = 6500
 
     def __init__(self):
         super().__init__()
-        self.keyword = ""
+        self._lock = threading.Lock()
+        self._pending = None       # (query, seq)，同时只留下最后一条
+        self.source = "auto"
         self._stop = False
+
+    def submit(self, query, seq):
+        with self._lock:
+            self._pending = (query, seq)
 
     def stop(self):
         self._stop = True
-        self.wait(2000)
+        self.wait(self.WORKER_WAIT_MS)
 
     def run(self):
         try:
@@ -1095,30 +1251,49 @@ class Searcher(QThread):
 
     def _loop(self):
         while not self._stop:
-            if self.keyword:
-                kw = self.keyword
-                self.keyword = ""
+            with self._lock:
+                job = self._pending
+                self._pending = None
+            if job:
+                query, seq = job
                 try:
-                    self.result_ready.emit(search_stocks(kw))
+                    items = providers.search_stocks(query, prefer=self.source)
                 except Exception:
-                    self.result_ready.emit([])
+                    items = []
+                if not self._stop:
+                    self.result_ready.emit(query, seq, items)
             time.sleep(0.15)
 
 
 # ---------------- 主窗口 ----------------
 class Ticker(QWidget):
+    # ---- 多选删除 ----
+    def _init_sel_mode(self):
+        self.sel_mode = False         # 是否处于多选状态
+        self.selected = set()         # 选中的完整代码，如 {"sh600519"}
+        self._press_row = None        # 按下时命中的行号
+        self._press_pos = None        # 按下时的全局坐标（判断是拖窗口还是长按）
+        self._moved = False           # 按下后是否移动过（移动过就不再算长按/点击）
+        self._long_timer = QTimer(self)
+        self._long_timer.setSingleShot(True)
+        self._long_timer.setInterval(450)      # 长按阈值
+        self._long_timer.timeout.connect(self._on_long_press)
+
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self.scale = float(cfg.get("ui_scale") or 1.0)
         self.rows = []
         self.indices = []
-        self.alerted = {}     # code -> 上次提醒时间戳（5 分钟冷却）
-        self.flash = {}       # code -> 触发时间戳（高亮 10 秒）
-        self.effects = {}     # code -> {"type": "fire"/"frost", "until": ts, "t0": ts}，收盘彩蛋
+        # 下面三个字典一律用 full（sh600519）做 key：sh000001 和 sz000001 的
+        # 6 位 code 都是 000001，用 code 会互相串
+        self._alert_armed = {}   # full -> 是否还能提醒（edge-trigger，回到安全区才重新武装）
+        self.flash = {}          # full -> 触发时间戳（高亮 10 秒）
+        self.effects = {}        # full -> {"type": "fire"/"frost", "until": ts, "t0": ts}，收盘彩蛋
         self._effect_date = None   # 彩蛋每天只在 14:57 触发一次
         self.err = ""
         self.updated_at = ""
+        self.quote_date = ""       # 数据是截至哪天的（休市时显示）
         self.drag_pos = None
         self.pulse = 0
         self._bg_lum = None        # 挂件背后壁纸的平均亮度（0-255），None = 还没采样
@@ -1130,22 +1305,16 @@ class Ticker(QWidget):
         self._dot_taps = 0         # 状态点连击计数（备用解锁）
         self._dot_taps_at = 0.0
         self._unlocked = bool(cfg.get("unlocked"))   # 隐藏菜单是否已解锁（持久化）
+        self._forced_festival = None   # 运行时强制开启的节日 key，不落盘
+        self.watchlist_generation = 0  # 当前自选股版本：旧版本的行情一律丢弃
 
         # 全局按键监听：焦点在搜索框里也能收到方向键/字母
         _app = QApplication.instance()
         if _app is not None:
             _app.installEventFilter(self)
 
-        # ---- 多选删除 ----
-        self.sel_mode = False         # 是否处于多选状态
-        self.selected = set()         # 选中的完整代码，如 {"sh600519"}
-        self._press_row = None        # 按下时命中的行号
-        self._press_pos = None        # 按下时的全局坐标（判断是拖窗口还是长按）
-        self._moved = False           # 按下后是否移动过（移动过就不再算长按/点击）
-        self._long_timer = QTimer(self)
-        self._long_timer.setSingleShot(True)
-        self._long_timer.setInterval(450)      # 长按阈值
-        self._long_timer.timeout.connect(self._on_long_press)
+        self._init_sel_mode()
+        self._init_hotkey()
 
         self.setFocusPolicy(Qt.StrongFocus)     # 让 Esc 能生效
         self.setWindowTitle(cfg.get("title") or "A股盯盘")
@@ -1171,9 +1340,11 @@ class Ticker(QWidget):
             self.move_to_default()
 
         self.fetcher = Fetcher()
-        self.fetcher.codes = cfg.get("codes") or []
+        self.watchlist_generation = self.fetcher.set_codes(cfg.get("codes") or [])
         self.fetcher.show_index = bool(cfg.get("show_index", True))
         self.fetcher.fast = int(cfg.get("interval") or 3)
+        self.fetcher.source = cfg.get("data_source") or "auto"
+        self.fetcher.set_spark_enabled(bool(cfg.get("spark", True)))
         self.fetcher.data_ready.connect(self.on_data)
         self.fetcher.failed.connect(self.on_fail)
         self.fetcher.start()
@@ -1199,6 +1370,72 @@ class Ticker(QWidget):
         self._bg_timer = QTimer(self)
         self._bg_timer.timeout.connect(lambda: self.sample_bg())
         self._bg_timer.start(20000)
+
+    # ---- 老板键 ----
+    def _init_hotkey(self):
+        """注册全局热键。被别的程序占了就静默当没设，不弹窗烦人。"""
+        self._hotkey = HotkeyFilter()
+        self._hotkey.callback = self.toggle_boss
+        app = QApplication.instance()
+        if app is not None:
+            app.installNativeEventFilter(self._hotkey)
+        self._boss_notified = False   # 第一次藏起来时提示一次"怎么恢复"
+        self.apply_boss_key(self.cfg.get("boss_key", DEFAULT_BOSS_KEY))
+
+    def apply_boss_key(self, spec):
+        """（重新）注册老板键，返回是否真的注册上了"""
+        return bool(self._hotkey.register(spec or ""))
+
+    def toggle_boss(self):
+        """老板键：一键隐藏 / 恢复"""
+        if self.isVisible():
+            self.hide()
+            # 第一次藏起来时说一声怎么恢复；没有托盘的环境（远程桌面等）就别弹了
+            if (not self._boss_notified and getattr(self, "tray", None)
+                    and QSystemTrayIcon.isSystemTrayAvailable()):
+                self._boss_notified = True
+                self.tray.showMessage(
+                    "A股盯盘", "已隐藏，按 %s 恢复" % hotkey_label(self.cfg.get("boss_key")),
+                    QSystemTrayIcon.Information, 5000)
+        else:
+            self.show()
+            self.raise_()
+
+    def set_boss_key(self, spec):
+        if not spec:                        # 留空 = 关闭，这不算失败
+            self.apply_boss_key("")
+            self.cfg["boss_key"] = ""
+            save_config(self.cfg)
+            return True
+        if self.apply_boss_key(spec):
+            self.cfg["boss_key"] = spec
+            save_config(self.cfg)
+            return True
+        QMessageBox.warning(
+            self, "老板键未生效",
+            "组合键「%s」没注册上，可能被别的程序占用了，换一个试试。" % spec)
+        self.apply_boss_key(self.cfg.get("boss_key", DEFAULT_BOSS_KEY))
+        return False
+
+    def edit_boss_key(self):
+        cur = self.cfg.get("boss_key") or ""
+        text, ok = QInputDialog.getText(
+            self, "自定义老板键",
+            "格式：修饰键+按键，如 Ctrl+Alt+H、Ctrl+Shift+F1\n"
+            "修饰键可选 Ctrl / Alt / Shift / Win；留空 = 关闭",
+            text=cur)
+        if not ok:
+            return
+        self.set_boss_key((text or "").strip())
+
+    def set_data_source(self, key):
+        self.cfg["data_source"] = key
+        save_config(self.cfg)
+        self.fetcher.source = key
+        self.searcher.source = key
+        # 换源了，老的分时走势不该再留着；set_spark_enabled 会顺手把 tick 归零
+        self.fetcher._spark_cache.clear()
+        self.fetcher.set_spark_enabled(bool(self.cfg.get("spark", True)))
 
     # ---- 窗口属性 ----
     def apply_flags(self):
@@ -1231,13 +1468,17 @@ class Ticker(QWidget):
         self.search_edit.show()
 
         self.searcher = Searcher()
+        self.searcher.source = self.cfg.get("data_source") or "auto"
         self.searcher.result_ready.connect(self.on_search_result)
         self.searcher.start()
 
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
-        self.search_timer.setInterval(320)          # 输入防抖
+        self.search_timer.setInterval(SEARCH_DEBOUNCE_MS)
         self.search_timer.timeout.connect(self.do_search)
+        self._last_kw = ""            # 上次搜过的关键字，避免同一个词重复发请求
+        self.search_seq = 0           # 请求编号：只有最新一次的结果会被采用
+        self.candidate_query = ""     # 当前候选列表对应的关键字（Enter 前要核对）
 
         self._update_edit_style()
         self.layout_children()
@@ -1260,20 +1501,33 @@ class Ticker(QWidget):
     def on_search_text(self, text):
         if not text.strip():
             self.candidates = []
+            self._last_kw = ""
             self.layout_children()
             return
-        self.search_timer.start()
+        self.search_timer.start()      # 连着打字只会在停手 300ms 后发一次
 
     def do_search(self):
         kw = self.search_edit.text().strip()
-        if kw:
-            self.searcher.keyword = kw
+        if not kw or kw == self._last_kw:
+            return                     # 同一个词不重复问（改了又改回来也别再发一次）
+        self._last_kw = kw
+        self.search_seq += 1           # 这次请求之前的编号全部作废
+        self.searcher.submit(kw, self.search_seq)
 
-    def on_search_result(self, items):
+    def on_search_result(self, query, seq, items):
+        """只有"编号最新 + 关键字还是当前输入"的结果才采用。
+
+        否则先发的旧请求后回来，会把已经切走的关键字的结果又显示出来。
+        """
+        if seq != self.search_seq:
+            return
+        if query != self.search_edit.text().strip():
+            return
         self.candidates = items
+        self.candidate_query = query
         self.cand_list.clear()
         for it in items:
-            tag = {"ZS": "指数", "ET": "基金", "GP-B": "B股"}.get(it.get("type", ""), "")
+            tag = {"ZS": "指数", "ETF": "基金", "ET": "基金"}.get(it.get("type", ""), "")
             label = "%s  %s%s" % (it["code"], it["name"], ("  · " + tag) if tag else "")
             self.cand_list.addItem(QListWidgetItem(label))
         self.layout_children()
@@ -1284,10 +1538,28 @@ class Ticker(QWidget):
             self.add_stock(self.candidates[idx])
 
     def add_first_candidate(self):
-        if self.candidates:
+        kw = self.search_edit.text().strip()
+        # 候选必须属于当前输入的这个关键字，否则回车会把上一个词的结果加进来
+        if self.candidates and self.candidate_query == kw:
             self.add_stock(self.candidates[0])
-        elif self.search_edit.text().strip():
+        elif kw:
             self.do_search()
+
+    def apply_watchlist(self, codes):
+        """改自选股的唯一入口。
+
+        去重 → 截断到 5 只 → 把已经不在列表里的行从 UI 上摘掉 → 换 generation
+        （让在途的旧行情作废）→ 落盘。编辑 / 添加 / 删除三个入口都走这里，
+        免得漏掉一处就出现"配置里没了、界面上还挂着"的脏状态。
+        """
+        codes = [c for c in dict.fromkeys(codes or []) if c][:5]
+        self.cfg["codes"] = codes
+        allowed = set(codes)
+        self.rows = [r for r in self.rows if r.get("full") in allowed]
+        self.watchlist_generation = self.fetcher.set_codes(codes)
+        save_config(self.cfg)
+        self.resize_to_rows()
+        self.update()
 
     def add_stock(self, item):
         codes = list(self.cfg.get("codes") or [])
@@ -1298,24 +1570,33 @@ class Ticker(QWidget):
         if len(codes) >= 5:
             codes = codes[:4]          # 满了就挤掉最后一只，让新加的进来
         codes.append(full)
-        self.cfg["codes"] = codes
-        save_config(self.cfg)
-        self.fetcher.codes = codes
-        self.fetcher._spark_tick = 0
+        self.apply_watchlist(codes)
         self._close_search()
-        self.resize_to_rows()
 
     def _close_search(self):
         self.candidates = []
         self.cand_list.clear()
         self.search_edit.clear()
+        self._last_kw = ""
+        self.candidate_query = ""
+        # 编号 +1：所有在途的旧搜索结果作废，Esc 之后不能再把候选弹回来
+        self.search_seq += 1
         self.layout_children()
 
     def eventFilter(self, obj, event):
-        if obj is self.search_edit and event.type() == QEvent.KeyPress:
-            if event.key() == Qt.Key_Escape:
+        """装在 QApplication 上的全局按键监听（焦点在搜索框里也能收到）。
+
+        **整个类只能有一个 eventFilter**。Python 里后定义的同名方法会整个覆盖
+        前一个 —— 之前这里就出现了第二个 eventFilter，把搜索框的 Esc 悄悄弄失效了。
+        tests/test_release_hygiene.py 会用 ast 扫重复的同类方法名防止复发。
+        """
+        if event.type() == QEvent.KeyPress:
+            # 搜索框的 Esc 优先处理，且不送进口令状态机
+            if obj is self.search_edit and event.key() == Qt.Key_Escape:
                 self._close_search()
                 return True
+            if not event.isAutoRepeat():
+                self._feed_konami(event.key())
         return super().eventFilter(obj, event)
 
     def move_to_default(self):
@@ -1364,10 +1645,18 @@ class Ticker(QWidget):
 
     # ---- 数据 ----
     def on_data(self, data):
+        # 换了自选股之后，旧 watchlist 的行情回来了就丢掉 —— 否则界面上会
+        # 短暂出现"已经删掉的股票"或"新代码配老价格"
+        gen = data.get("generation")
+        if gen is not None and gen != self.watchlist_generation:
+            return
         self.rows = (data.get("rows") or [])[:5]
         self.indices = data.get("idx") or []
         self.err = ""
-        self.updated_at = datetime.now().strftime("%H:%M:%S")
+        self.updated_at = market_clock.market_now().strftime("%H:%M:%S")
+        # 数据是截至哪天的（收盘/休市时显示；接口时间戳优先，认不出才按日历推算）
+        self.quote_date = market_clock.last_quote_mmdd(
+            [r.get("time") for r in self.rows])
         self.pulse = 3
         self.resize_to_rows()
         self.check_alert(self.rows)
@@ -1417,50 +1706,69 @@ class Ticker(QWidget):
 
     def _festival(self):
         """今天生效的节日（同时只有一个），带一次一日的缓存"""
-        return active_festival(self.cfg)
+        return active_festival(forced=self._forced_festival)
 
     def check_alert(self, rows):
-        """涨跌幅超阈值 → 托盘气泡 + 该行高亮闪烁"""
+        """涨跌幅超阈值 → 托盘气泡 + 该行高亮闪烁。
+
+        两道闸门：
+        1. 不在交易时段（收盘 / 午休 / 周末 / 法定休市）一律不提醒。收盘后每 60 秒
+           还拉一次行情，光靠"5 分钟冷却"会一直重复弹同一条。
+        2. edge-trigger：突破阈值才提醒，回落到 (阈值 - ALERT_REARM_GAP) 以下重新
+           武装，再次突破才再提醒。一直待在阈值外不再重复。
+        """
         th = float(self.cfg.get("alert_pct") or 0)
-        if th <= 0:
+        if th <= 0 or not market_clock.is_trading_now():
             return
         now = time.time()
+        rearm = max(0.0, th - ALERT_REARM_GAP)
         msgs = []
         for r in rows:
-            if abs(r["pct"]) >= th:
-                if now - self.alerted.get(r["code"], 0) > 300:      # 同一只 5 分钟内不重复
-                    self.alerted[r["code"]] = now
-                    self.flash[r["code"]] = now
+            full = r.get("full")
+            if not full:
+                continue
+            pct = abs(r.get("pct", 0))
+            if pct >= th:
+                if self._alert_armed.get(full, True):
+                    self._alert_armed[full] = False
+                    self.flash[full] = now
                     msgs.append("%s  %+.2f%%" % (r["name"], r["pct"]))
+            elif pct <= rearm:
+                self._alert_armed[full] = True     # 回到安全区，下次再破阈值还要提醒
         if msgs and getattr(self, "tray", None):
             self.tray.showMessage("A股盯盘 · 异动", "\n".join(msgs),
                                   QSystemTrayIcon.Information, 6000)
 
     def check_close_effect(self, rows):
-        """收盘彩蛋：14:57 集合竞价这一刻，涨幅超阈值 -> 燃烧 3 分钟；跌幅超阈值 -> 结霜 3 分钟。
-        每个交易日只触发一次。"""
+        """收盘彩蛋：14:57-15:00 这段里，涨幅超阈值 → 燃烧 3 分钟；跌幅超阈值 → 结霜 3 分钟。
+
+        以前只认 (14, 57) 这一分钟：那一刻网络抖一下、或者程序 14:58 才启动，
+        就永久错过。改成整段窗口内"第一次拿到当天有效行情"时触发；行情时间戳
+        不是今天的就不算，免得拿昨天的陈数据放彩蛋。每个交易日只触发一次。
+        """
         th = float(self.cfg.get("effect_pct") or 0)
-        if th <= 0 or not is_trading_now():
+        if th <= 0 or market_clock.market_phase() != market_clock.CLOSING_CALL:
             return
-        now = datetime.now()
-        if (now.hour, now.minute) != EFFECT_MINUTE:
-            return
+        now = market_clock.market_now()
         today = now.strftime("%Y-%m-%d")
         if self._effect_date == today:
             return
+        if not any((r.get("time") or "").startswith(now.strftime("%Y%m%d"))
+                   for r in rows):
+            return                      # 手里的还是昨天的数，等下一轮
         self._effect_date = today
         until = time.time() + EFFECT_SECONDS
         hit_fire, hit_frost = [], []
         for r in rows:
-            code = r.get("code")
-            if not code:
+            full = r.get("full")
+            if not full:
                 continue
             pct = r.get("pct", 0)
             if pct >= th:
-                self.effects[code] = {"type": "fire", "until": until, "t0": time.time()}
+                self.effects[full] = {"type": "fire", "until": until, "t0": time.time()}
                 hit_fire.append(r["name"])
             elif pct <= -th:
-                self.effects[code] = {"type": "frost", "until": until, "t0": time.time()}
+                self.effects[full] = {"type": "frost", "until": until, "t0": time.time()}
                 hit_frost.append(r["name"])
         msgs = []
         if hit_fire:
@@ -1492,7 +1800,7 @@ class Ticker(QWidget):
             p.drawPath(path)
 
         # 头部 —— 状态圆点 + 标题（左上角不画任何节日图形）
-        dot_color = QColor("#4ade80") if is_trading_now() else QColor("#6b7280")
+        dot_color = QColor(market_clock.PHASE_DOT[market_clock.market_phase()])
         if self.pulse > 0:
             dot_color = QColor("#ffffff") if self.pulse % 2 else dot_color
         p.setPen(Qt.NoPen)
@@ -1835,7 +2143,7 @@ class Ticker(QWidget):
             p.drawPath(hl)
 
         # 收盘彩蛋（14:57 定格，持续 3 分钟）
-        eff = self._row_effect(r.get("code"))
+        eff = self._row_effect(r.get("full"))
         if eff == "fire":
             self._draw_fire(p, 6, y + 2, w - 12, ROW_H - 4)
         elif eff == "frost":
@@ -1845,7 +2153,7 @@ class Ticker(QWidget):
             QColor(19, 53, 119, 205) if eff == "frost" else None)   # #133577
 
         # 异动高亮（触发后 10 秒内呼吸闪烁）
-        ft = self.flash.get(r["code"])
+        ft = self.flash.get(r.get("full"))
         if ft and time.time() - ft < 10:
             glow = QPainterPath()
             glow.addRoundedRect(QRectF(6, y + 2, w - 12, ROW_H - 4), 8, 8)
@@ -1858,21 +2166,10 @@ class Ticker(QWidget):
         ox = 0                 # 内容整体右移，给复选框腾位置
         if self.sel_mode:
             ox = 22
-            cbx, cby, cbs = 14, y + (ROW_H - 15) / 2, 15
-            box = QPainterPath()
-            box.addRoundedRect(QRectF(cbx, cby, cbs, cbs), 4, 4)
-            if sel:
-                p.setPen(Qt.NoPen)
-                p.setBrush(QColor("#60a5fa"))
-                p.drawPath(box)
-                p.setPen(QPen(QColor("#0b1020"), 2))
-                p.setBrush(Qt.NoBrush)
-                p.drawLine(cbx + 4, cby + 7.5, cbx + 6.5, cby + 10.5)
-                p.drawLine(cbx + 6.5, cby + 10.5, cbx + 11, cby + 4.5)
-            else:
-                p.setPen(QPen(QColor(255, 255, 255, 110), 1.2))
-                p.setBrush(Qt.NoBrush)
-                p.drawPath(box)
+            self._draw_checkbox(p, 14, y + (ROW_H - 15) / 2, sel)
+
+        status = r.get("status") or providers.NORMAL
+        halted = status == HALT
 
         # 名称 + 代码
         p.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
@@ -1882,6 +2179,10 @@ class Ticker(QWidget):
         fm = QFontMetrics(QFont("Microsoft YaHei", 9, QFont.Bold))
         nx = 14 + ox + fm.horizontalAdvance(name) + 6
         self._text(p, QRect(nx, y + 7, 60, 16), Qt.AlignVCenter | Qt.AlignLeft, r["code"], self._fg_fade())
+
+        # 停牌 / 涨停 / 跌停：涨跌幅左边挂个实心小标签，一眼能看出来
+        if status != providers.NORMAL:
+            self._draw_status_badge(p, status, color, w - 14 - 58 - 30, y + 6)
 
         # 涨跌幅色块
         bw, bh = 58, 20
@@ -1895,48 +2196,98 @@ class Ticker(QWidget):
             p.setBrush(QColor(color.red(), color.green(), color.blue(), ba))
             p.drawPath(block)
         p.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
-        sign = "+" if pct > 0 else ""
-        self._text(p, QRectF(bx, by, bw, bh), Qt.AlignCenter, "%s%.2f%%" % (sign, pct), color, ol)
+        if halted:
+            self._text(p, QRectF(bx, by, bw, bh), Qt.AlignCenter, "--", self._fg_fade(), ol)
+        else:
+            sign = "+" if pct > 0 else ""
+            self._text(p, QRectF(bx, by, bw, bh), Qt.AlignCenter,
+                       "%s%.2f%%" % (sign, pct), color, ol)
 
-        # 现价 + 涨跌额
+        # 现价 + 涨跌额（停牌没有现价，直接写"停牌"）
         d = r.get("decimals", 2)
         p.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
-        price_txt = "%.*f" % (d, r["price"])
-        self._text(p, QRect(14 + ox, y + 24, 90, 18), Qt.AlignVCenter | Qt.AlignLeft, price_txt, color, ol)
+        price_txt = "--" if halted else "%.*f" % (d, r["price"])
+        self._text(p, QRect(14 + ox, y + 24, 90, 18), Qt.AlignVCenter | Qt.AlignLeft,
+                   price_txt, self._flat() if halted else color, ol)
         pw = QFontMetrics(QFont("Microsoft YaHei", 12, QFont.Bold)).horizontalAdvance(price_txt)
         p.setFont(QFont("Microsoft YaHei", 7.5))
-        chg_txt = "%s%.*f" % ("+" if r["change"] > 0 else "", d, r["change"])
-        self._text(p, QRect(14 + ox + pw + 6, y + 25, 70, 16), Qt.AlignVCenter | Qt.AlignLeft, chg_txt, color, ol)
+        if halted:
+            chg_txt = ""
+        else:
+            chg_txt = "%s%.*f" % ("+" if r["change"] > 0 else "", d, r["change"])
+            self._text(p, QRect(14 + ox + pw + 6, y + 25, 70, 16),
+                       Qt.AlignVCenter | Qt.AlignLeft, chg_txt, color, ol)
 
-        # 持仓盈亏（只在填了成本价的股票上显示）
-        pos = (self.cfg.get("positions") or {}).get(r.get("full", ""))
-        if pos and pos.get("cost"):
-            try:
-                cost = float(pos["cost"])
-            except (TypeError, ValueError):
-                cost = 0.0
-            if cost > 0:
-                pl_pct = (r["price"] - cost) / cost * 100
-                plc = (self._up() if pl_pct > 0
-                       else (self._down() if pl_pct < 0 else self._flat()))
-                shares = pos.get("shares")
-                if shares:
-                    amt = (r["price"] - cost) * float(shares)
-                    ptxt = "%+.0f (%+.1f%%)" % (amt, pl_pct)
-                else:
-                    ptxt = "%+.2f%%" % pl_pct
-                cw = QFontMetrics(QFont("Microsoft YaHei", 7.5)).horizontalAdvance(chg_txt)
-                p.setFont(QFont("Microsoft YaHei", 7.5, QFont.Bold))
-                self._text(p, QRect(14 + ox + pw + 6 + cw + 8, y + 25, 84, 16),
-                           Qt.AlignVCenter | Qt.AlignLeft, ptxt, plc, ol)
+        # 持仓盈亏（只在填了成本价、且没停牌的股票上显示）
+        if not halted:
+            self._draw_pnl(p, r, 14 + ox + pw + 6, y + 25, chg_txt, ol)
 
         # 分时走势
-        if self.cfg.get("spark", True):
+        if self.cfg.get("spark", True) and not halted:
             pts = r.get("spark")
             if pts and len(pts) > 2:
-                sx, sy = w - 14 - 62, y + 24
-                sw, sh = 62, 18
-                self._spark(p, pts, sx, sy, sw, sh, color, r["prev"])
+                self._spark(p, pts, w - 14 - 62, y + 24, 62, 18, color, r["prev"])
+
+    def _draw_checkbox(self, p, x, y, checked):
+        """多选模式左侧的复选框"""
+        box = QPainterPath()
+        box.addRoundedRect(QRectF(x, y, 15, 15), 4, 4)
+        if checked:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#60a5fa"))
+            p.drawPath(box)
+            p.setPen(QPen(QColor("#0b1020"), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawLine(x + 4, y + 7.5, x + 6.5, y + 10.5)
+            p.drawLine(x + 6.5, y + 10.5, x + 11, y + 4.5)
+        else:
+            p.setPen(QPen(QColor(255, 255, 255, 110), 1.2))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(box)
+
+    def _draw_status_badge(self, p, status, color, x, y):
+        """停牌 / 涨停 / 跌停的实心小标签，贴在涨跌幅色块左边"""
+        text = providers.STATUS_TEXT.get(status)
+        if not text:
+            return
+        bw, bh = 28, 20
+        if status == LIMIT_UP:
+            bg = self._up()
+        elif status == LIMIT_DN:
+            bg = self._down()
+        else:
+            bg = self._flat()
+        bp = QPainterPath()
+        bp.addRoundedRect(QRectF(x, y, bw, bh), 5, 5)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(bg.red(), bg.green(), bg.blue(), 205))
+        p.drawPath(bp)
+        p.setFont(QFont("Microsoft YaHei", 7, QFont.Bold))
+        self._text(p, QRectF(x, y, bw, bh), Qt.AlignCenter, text, QColor("#ffffff"))
+
+    def _draw_pnl(self, p, r, x, y, chg_txt, ol):
+        """持仓盈亏。只在填了成本价时才有东西可画。"""
+        pos = (self.cfg.get("positions") or {}).get(r.get("full", ""))
+        if not pos or not pos.get("cost"):
+            return
+        try:
+            cost = float(pos["cost"])
+        except (TypeError, ValueError):
+            return
+        if cost <= 0:
+            return
+        pl_pct = (r["price"] - cost) / cost * 100
+        plc = (self._up() if pl_pct > 0
+               else (self._down() if pl_pct < 0 else self._flat()))
+        shares = pos.get("shares")
+        if shares:
+            ptxt = "%+.0f (%+.1f%%)" % ((r["price"] - cost) * float(shares), pl_pct)
+        else:
+            ptxt = "%+.2f%%" % pl_pct
+        cw = QFontMetrics(QFont("Microsoft YaHei", 7.5)).horizontalAdvance(chg_txt)
+        p.setFont(QFont("Microsoft YaHei", 7.5, QFont.Bold))
+        self._text(p, QRect(x + cw + 8, y, 84, 16),
+                   Qt.AlignVCenter | Qt.AlignLeft, ptxt, plc, ol)
 
     def _spark(self, p, pts, x, y, w, h, color, prev):
         lo, hi = min(pts), max(pts)
@@ -1968,6 +2319,19 @@ class Ticker(QWidget):
         p.drawPath(path)
         p.restore()
 
+    def _status_text(self):
+        """底栏状态行：更新时刻 + 刷新间隔 + 时段。
+
+        不在交易中时手里的数就是上一次收盘的，补一句"截至 MM-dd"说清楚是哪天的。
+        """
+        phase = market_clock.market_phase()
+        text = "更新 %s · %ss · %s" % (self.updated_at,
+                                       self.cfg.get("interval", 3),
+                                       market_clock.PHASE_TEXT[phase])
+        if phase not in market_clock.OPEN_PHASES and self.quote_date:
+            text += " · 截至 %s" % self.quote_date
+        return text
+
     def _footer(self, p, w, h):
         p.setFont(QFont("Microsoft YaHei", 7))
         if self.sel_mode:
@@ -1991,9 +2355,7 @@ class Ticker(QWidget):
                 p.setFont(QFont("Microsoft YaHei", 7, QFont.Bold))
                 self._text(p, rect.toRect(), Qt.AlignCenter, label, fg)
             return
-        status = self.err or ("更新 %s · %ss · %s" % (
-            self.updated_at, self.cfg.get("interval", 3),
-            "交易中" if is_trading_now() else "休市"))
+        status = self.err or self._status_text()
         self._text(p, QRect(14, h - FOOTER_H, w - 28, FOOTER_H), Qt.AlignVCenter | Qt.AlignLeft,
                    status, self._fg_fade())
 
@@ -2055,16 +2417,13 @@ class Ticker(QWidget):
             self.exit_sel_mode()
             return
         codes = [c for c in (self.cfg.get("codes") or []) if c not in self.selected]
-        self.cfg["codes"] = codes
         positions = self.cfg.get("positions") or {}
         for c in self.selected:
             positions.pop(c, None)      # 删股票同时清掉它的持仓，免得留下脏数据
         self.cfg["positions"] = positions
-        save_config(self.cfg)
-        self.fetcher.codes = codes
-        self.fetcher._spark_tick = 0
         self.exit_sel_mode()
-        self.resize_to_rows()
+        # 走统一入口：删到一只不剩时也要立刻把界面清空
+        self.apply_watchlist(codes)
 
     def mousePressEvent(self, e):
         # 拿到键盘焦点：全局监听只能收到"进入本应用"的按键，窗口没焦点时
@@ -2088,18 +2447,7 @@ class Ticker(QWidget):
                 e.accept()
                 return
 
-        if e.button() == Qt.RightButton:
-            if self.sel_mode:
-                self.exit_sel_mode()          # 多选态下右键 = 取消
-                e.accept()
-                return
-            if kind == "row":
-                self.enter_sel_mode(idx)      # 在股票上右键 = 进入多选并勾上它
-                self.show_row_menu(e.globalPosition().toPoint(), idx)
-            else:
-                self.show_menu(e.globalPosition().toPoint())
-            e.accept()
-            return
+        # 右键不在这里处理 —— 统一交给 contextMenuEvent，否则一次右键弹两次菜单
 
         if e.button() == Qt.LeftButton:
             if self.sel_mode:
@@ -2162,20 +2510,16 @@ class Ticker(QWidget):
         super().keyPressEvent(e)
 
     def closeEvent(self, e):
-        # 摘掉装在 QApplication 上的全局监听，否则本对象销毁后 app 还会回调它
-        _app = QApplication.instance()
-        if _app is not None:
-            _app.removeEventFilter(self)
-        # 窗口被关（Alt+F4 等）不走 quit()，这里也要清一次强制特效
-        self.clear_forced_festivals()
-        super().closeEvent(e)
+        """Alt+F4 / 标题栏关闭：只藏起来，不真的退出。
+
+        应用开了 setQuitOnLastWindowClosed(False)，托盘还在，窗口随时会从托盘
+        恢复。以前这里会摘掉装在 QApplication 上的全局按键监听 —— 恢复之后
+        对象还在用，却再也收不到按键了。摘监听只放在 quit() 里。
+        """
+        e.ignore()
+        self.hide()
 
     # ---- 隐藏菜单的解锁口令：↑↑↓↓←→←→ B A B A ----
-    def eventFilter(self, obj, ev):
-        if ev.type() == QEvent.KeyPress and not ev.isAutoRepeat():
-            self._feed_konami(ev.key())
-        return False   # 绝不拦截，原样放行（搜索框还要正常打字）
-
     def _feed_konami(self, key):
         now = time.time()
         # 口令必须在 KONAMI_TIMEOUT 秒内一口气输完，超时作废重来
@@ -2242,7 +2586,22 @@ class Ticker(QWidget):
         self.update()
 
     def contextMenuEvent(self, e):
-        self.show_menu(e.globalPosition().toPoint())
+        """右键菜单的唯一入口。
+
+        mousePressEvent 里以前也处理了一次右键：按下弹一次、抬起时 Qt 再发
+        contextMenuEvent 又弹一次。右键逻辑全部收在这里。
+        """
+        pos = e.globalPosition().toPoint() if hasattr(e, "globalPosition") else e.globalPos()
+        lx, ly = self._logic_pos(e)
+        kind, idx = self.hit_test(lx, ly)
+        if self.sel_mode:
+            self.exit_sel_mode()          # 多选态下右键 = 取消
+            return
+        if kind == "row":
+            self.enter_sel_mode(idx)      # 在股票上右键 = 进入多选并勾上它
+            self.show_row_menu(pos, idx)
+        else:
+            self.show_menu(pos)
 
     def mouseDoubleClickEvent(self, e):
         self.show_menu(e.globalPosition().toPoint())
@@ -2289,39 +2648,79 @@ class Ticker(QWidget):
         self._build_menu(m)
         m.exec(pos)
 
+    def _check_menu(self, parent, title, choices, current, on_pick):
+        """一组互斥选项的子菜单：当前项打勾，点了走回调。
+
+        刷新间隔 / 各个阈值 / 透明度 / 界面大小全都是这个套路，写一遍就够。
+        """
+        sub = parent.addMenu(title)
+        for label, v in choices:
+            a = sub.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(current == v)
+            a.triggered.connect(lambda _, x=v: on_pick(x))
+        return sub
+
+    def _toggle_action(self, parent, label, key, on_toggle, default=False):
+        """一个可勾选的开关项，勾选状态直接读配置"""
+        a = parent.addAction(label)
+        a.setCheckable(True)
+        a.setChecked(bool(self.cfg.get(key, default)))
+        a.triggered.connect(on_toggle)
+        return a
+
     def _build_menu(self, m):
         """右键菜单的内容。
 
         单独拆成方法是为了可测：QMenu.exec() 会阻塞事件循环（而且是 C++ 绑定，
         monkeypatch 不掉），拆出来后测试可以直接构造菜单检查项，不用真的弹出。
         """
+        self._menu_stocks(m)
+        self._menu_data(m)
+        self._menu_look(m)
+        m.addSeparator()
+        self._menu_toggles(m)
+        self._menu_backup(m)
+        m.addSeparator()
+        m.addAction("隐藏到托盘").triggered.connect(self.hide)
+        m.addAction("退出").triggered.connect(self.quit)
+        m.addSeparator()
+        act_about = m.addAction("%s %s" % (APP_NAME, APP_VERSION))
+        act_about.setEnabled(False)
+
+    def _menu_stocks(self, m):
         m.addAction("修改标题").triggered.connect(self.edit_title)
         m.addAction("多选删除股票…").triggered.connect(lambda: self.enter_sel_mode())
         m.addAction("编辑股票代码（最多5只）").triggered.connect(self.edit_codes)
         m.addAction("编辑持仓成本 / 盈亏").triggered.connect(self.edit_positions)
 
-        sub_i = m.addMenu("刷新间隔")
-        for v in (1, 3, 5, 10, 30):
-            a = sub_i.addAction("%d 秒" % v)
-            a.setCheckable(True)
-            a.setChecked(int(self.cfg.get("interval", 3)) == v)
-            a.triggered.connect(lambda _, x=v: self.set_interval(x))
+    def _menu_data(self, m):
+        """取数相关的设置：刷新频率、阈值、数据源、老板键"""
+        self._check_menu(m, "刷新间隔", [("%d 秒" % v, v) for v in (1, 3, 5, 10, 30)],
+                         int(self.cfg.get("interval", 3)), self.set_interval)
 
-        sub_a = m.addMenu("异动提醒阈值")
-        cur_a = float(self.cfg.get("alert_pct") or 0)
-        for label, v in (("关闭", 0), ("±1%", 1.0), ("±2%", 2.0), ("±3%", 3.0), ("±5%", 5.0)):
-            a = sub_a.addAction(label)
-            a.setCheckable(True)
-            a.setChecked(abs(cur_a - v) < 0.01)
-            a.triggered.connect(lambda _, x=v: self.set_alert(x))
+        self._check_menu(m, "异动提醒阈值",
+                         [("关闭", 0.0), ("±1%", 1.0), ("±2%", 2.0),
+                          ("±3%", 3.0), ("±5%", 5.0)],
+                         float(self.cfg.get("alert_pct") or 0), self.set_alert)
 
-        sub_e = m.addMenu("收盘彩蛋阈值（14:57）")
-        cur_e = float(self.cfg.get("effect_pct") or 0)
-        for label, v in (("关闭", 0), ("±2%", 2.0), ("±3%", 3.0), ("±5%", 5.0)):
-            a = sub_e.addAction(label)
+        self._check_menu(m, "收盘彩蛋阈值（14:57）",
+                         [("关闭", 0.0), ("±2%", 2.0), ("±3%", 3.0), ("±5%", 5.0)],
+                         float(self.cfg.get("effect_pct") or 0), self.set_effect_pct)
+
+        self._check_menu(m, "数据源",
+                         [(label, key) for key, label in providers.SOURCE_CHOICES],
+                         self.cfg.get("data_source") or "auto", self.set_data_source)
+
+        sub_k = m.addMenu("老板键（一键隐藏）")
+        cur_k = self.cfg.get("boss_key", DEFAULT_BOSS_KEY)
+        for spec in BOSS_KEY_PRESETS:
+            a = sub_k.addAction(hotkey_label(spec))
             a.setCheckable(True)
-            a.setChecked(abs(cur_e - v) < 0.01)
-            a.triggered.connect(lambda _, x=v: self.set_effect_pct(x))
+            a.setChecked(cur_k == spec)
+            a.triggered.connect(lambda _, x=spec: self.set_boss_key(x))
+        sub_k.addSeparator()
+        sub_k.addAction("自定义…").triggered.connect(self.edit_boss_key)
 
         # 节日彩蛋 —— 默认隐藏，需口令 ↑↑↓↓←→←→ B A B A 解锁
         if self._unlocked:
@@ -2337,65 +2736,36 @@ class Ticker(QWidget):
             for f in FESTIVALS:                 # 表驱动：加节日不用改这里
                 a = sub_f.addAction("%s %s（强制）" % (f["icon"], f["name"]))
                 a.setCheckable(True)
-                a.setChecked(bool(self.cfg.get(f["key"] + "_test")))
+                a.setChecked(self._forced_festival == f["key"])
                 a.triggered.connect(lambda _, k=f["key"]: self.toggle_festival(k))
             sub_f.addSeparator()
             sub_f.addAction("全部关闭").triggered.connect(self.clear_festivals)
             sub_f.addAction("🔒 收起节日特效菜单").triggered.connect(self.lock_hidden_menu)
 
-        sub_o = m.addMenu("背景透明度")
-        for label, v in (("0%（仅文字）", 0), ("20%", 51), ("40%", 102),
-                         ("60%", 153), ("75%", 191), ("90%", 230), ("100%", 255)):
-            a = sub_o.addAction(label)
-            a.setCheckable(True)
-            a.setChecked(int(self.cfg.get("bg_alpha", 190)) == v)
-            a.triggered.connect(lambda _, x=v: self.set_alpha(x))
+    def _menu_look(self, m):
+        self._check_menu(m, "背景透明度",
+                         [("0%（仅文字）", 0), ("20%", 51), ("40%", 102),
+                          ("60%", 153), ("75%", 191), ("90%", 230), ("100%", 255)],
+                         int(self.cfg.get("bg_alpha", 190)), self.set_alpha)
 
-        sub_s = m.addMenu("界面大小")
-        for label, v in (("小 85%", 0.85), ("标准", 1.0), ("大 115%", 1.15), ("特大 130%", 1.3)):
-            a = sub_s.addAction(label)
-            a.setCheckable(True)
-            a.setChecked(abs(self.scale - v) < 0.01)
-            a.triggered.connect(lambda _, x=v: self.set_scale(x))
+        self._check_menu(m, "界面大小",
+                         [("小 85%", 0.85), ("标准", 1.0),
+                          ("大 115%", 1.15), ("特大 130%", 1.3)],
+                         round(self.scale, 3), self.set_scale)
 
-        m.addSeparator()
+    def _menu_toggles(self, m):
+        self._toggle_action(m, "大盘指数（上证/深证/创业板）", "show_index",
+                            self.toggle_index, True)
+        self._toggle_action(m, "分时走势图", "spark", self.toggle_spark, True)
+        self._toggle_action(m, "拖动吸附屏幕边缘", "snap", self.toggle_snap, True)
+        self._toggle_action(m, "锁定位置", "locked", self.toggle_lock)
+        self._toggle_action(m, "始终置顶", "always_on_top", self.toggle_top, True)
+        self._toggle_action(m, "鼠标穿透（用托盘恢复）", "click_through",
+                            self.toggle_click_through)
+        self._toggle_action(m, "开机自启", "autostart", self.toggle_autostart)
 
-        a_idx = m.addAction("大盘指数（上证/深证/创业板）")
-        a_idx.setCheckable(True)
-        a_idx.setChecked(bool(self.cfg.get("show_index", True)))
-        a_idx.triggered.connect(self.toggle_index)
-
-        a_spark = m.addAction("分时走势图")
-        a_spark.setCheckable(True)
-        a_spark.setChecked(bool(self.cfg.get("spark", True)))
-        a_spark.triggered.connect(self.toggle_spark)
-
-        a_snap = m.addAction("拖动吸附屏幕边缘")
-        a_snap.setCheckable(True)
-        a_snap.setChecked(bool(self.cfg.get("snap", True)))
-        a_snap.triggered.connect(self.toggle_snap)
-
-        a_lock = m.addAction("锁定位置")
-        a_lock.setCheckable(True)
-        a_lock.setChecked(bool(self.cfg.get("locked")))
-        a_lock.triggered.connect(self.toggle_lock)
-
-        a_top = m.addAction("始终置顶")
-        a_top.setCheckable(True)
-        a_top.setChecked(bool(self.cfg.get("always_on_top", True)))
-        a_top.triggered.connect(self.toggle_top)
-
-        a_ct = m.addAction("鼠标穿透（用托盘恢复）")
-        a_ct.setCheckable(True)
-        a_ct.setChecked(bool(self.cfg.get("click_through")))
-        a_ct.triggered.connect(self.toggle_click_through)
-
-        a_auto = m.addAction("开机自启")
-        a_auto.setCheckable(True)
-        a_auto.setChecked(bool(self.cfg.get("autostart")))
-        a_auto.triggered.connect(self.toggle_autostart)
-
-        # 配置备份 / 回滚：持仓成本被误删过，有存档就能捞回来
+    def _menu_backup(self, m):
+        """配置备份 / 回滚：持仓成本被误删过，有存档就能捞回来"""
         sub_b = m.addMenu("配置备份")
         sub_b.addAction("立即备份").triggered.connect(self.backup_now)
         sub_b.addAction("打开备份目录").triggered.connect(self.open_backup_dir)
@@ -2417,13 +2787,6 @@ class Ticker(QWidget):
             a_none = sub_b.addAction("（暂无备份）")
             a_none.setEnabled(False)
 
-        m.addSeparator()
-        m.addAction("隐藏到托盘").triggered.connect(self.hide)
-        m.addAction("退出").triggered.connect(self.quit)
-        m.addSeparator()
-        act_about = m.addAction("%s %s" % (APP_NAME, APP_VERSION))
-        act_about.setEnabled(False)
-
     # ---- 菜单动作 ----
     def edit_codes(self):
         cur = ", ".join(self.cfg.get("codes") or [])
@@ -2442,14 +2805,7 @@ class Ticker(QWidget):
                 codes.append(c)
             else:
                 bad.append(item)
-        codes = codes[:5]
-        self.cfg["codes"] = codes
-        save_config(self.cfg)
-        self.fetcher.codes = codes
-        self.fetcher._spark_tick = 0
-        self.rows = []
-        self.resize_to_rows()
-        self.update()
+        self.apply_watchlist(codes)
         if bad:
             QMessageBox.warning(self, "部分代码未识别", "未识别：%s" % ", ".join(bad))
 
@@ -2510,20 +2866,16 @@ class Ticker(QWidget):
         self.update()
 
     def toggle_festival(self, key):
-        """菜单切换某个节日的「强制开启」。同时只让一个生效 —— 打开这个就关掉别的。"""
-        k = key + "_test"
-        on = not self.cfg.get(k)
-        for f in FESTIVALS:                 # 单激活：一次只能强制一个
-            self.cfg[f["key"] + "_test"] = False
-        self.cfg[k] = on
-        save_config(self.cfg)
+        """菜单切换某个节日的「强制开启」。同一时刻只有一个生效。
+
+        只改内存、不落盘：这是临时调试用的，重启就该回到按日期自动触发。
+        """
+        self._forced_festival = None if self._forced_festival == key else key
         self.update()
 
     def clear_festivals(self):
         """全部关闭（回到按日期自动触发）"""
-        for f in FESTIVALS:
-            self.cfg[f["key"] + "_test"] = False
-        save_config(self.cfg)
+        self._forced_festival = None
         self.update()
 
     def _update_edit_style(self):
@@ -2556,8 +2908,13 @@ class Ticker(QWidget):
         self.update()
 
     def toggle_spark(self):
-        self.cfg["spark"] = not self.cfg.get("spark", True)
+        on = not self.cfg.get("spark", True)
+        self.cfg["spark"] = on
         save_config(self.cfg)
+        self.fetcher.set_spark_enabled(on)   # 关了就别在后台继续拉分时
+        if not on:
+            for r in self.rows:
+                r["spark"] = None
         self.update()
 
     def toggle_lock(self):
@@ -2581,9 +2938,15 @@ class Ticker(QWidget):
         self.apply_flags()
 
     def toggle_autostart(self):
-        self.cfg["autostart"] = not self.cfg.get("autostart")
+        """先改注册表，成功了才落配置 —— 免得注册表没写进去、菜单却显示成已开启"""
+        want = not self.cfg.get("autostart")
+        if not set_autostart(want):
+            QMessageBox.warning(
+                self, "开机自启未生效",
+                "写注册表失败，开机自启仍是「%s」。" % ("开" if self.cfg.get("autostart") else "关"))
+            return
+        self.cfg["autostart"] = want
         save_config(self.cfg)
-        set_autostart(self.cfg["autostart"])
 
     # ---- 配置备份 / 恢复 ----
     def backup_now(self):
@@ -2634,13 +2997,12 @@ class Ticker(QWidget):
     def build_tray(self):
         self.tray = QSystemTrayIcon(self)
         self.tray.setIcon(make_icon(FLAT))
-        self.tray.activated.connect(lambda r: self.showNormal() if r == QSystemTrayIcon.Trigger else None)
+        self.tray.activated.connect(self._on_tray_activated)
         tm = QMenu()
         tm.setStyleSheet("QMenu{background:#181a20;color:#e8eaed;border:1px solid #2a2d35;padding:5px;}"
                          "QMenu::item{padding:6px 22px;border-radius:4px;font-family:'Microsoft YaHei';font-size:9pt;}"
                          "QMenu::item:selected{background:#2a2f3a;}")
-        tm.addAction("显示 / 隐藏").triggered.connect(
-            lambda: self.hide() if self.isVisible() else self.showNormal())
+        tm.addAction("显示 / 隐藏").triggered.connect(self.toggle_boss)
         tm.addAction("编辑股票").triggered.connect(self.edit_codes)
         tm.addAction("取消鼠标穿透").triggered.connect(
             lambda: (self.cfg.update({"click_through": False}), save_config(self.cfg), self.apply_flags()))
@@ -2648,6 +3010,11 @@ class Ticker(QWidget):
         tm.addAction("退出").triggered.connect(self.quit)
         self.tray.setContextMenu(tm)
         self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        """托盘左键 = 显示 / 隐藏（README 就是这么写的，以前只做了 showNormal）"""
+        if reason == QSystemTrayIcon.Trigger:
+            self.toggle_boss()
 
     def update_tray_tip(self):
         if not self.rows:
@@ -2679,15 +3046,16 @@ class Ticker(QWidget):
         self.tray.setIcon(make_icon(UP if avg > 0 else (DOWN if avg < 0 else FLAT)))
 
     def clear_forced_festivals(self):
-        """把所有「强制开启」的节日特效清掉 —— 特效只在特定日期自动触发。
+        """清掉配置里的历史遗留字段（老版本把「强制开启」存进过 stocks.json）。
 
-        手动开的强制开关是持久化的，不清的话上次开的会一直挂着：
-        2 月开的爱心能飘到 8 月。所以退出前一律清干净。
+        强制开关现在只存在内存里，这几个键已经没人写了；但老配置文件里可能还留着，
+        顺手清干净，免得 validate_config 之外再多一份脏数据。
         """
-        if not any(self.cfg.get(f["key"] + "_test") for f in FESTIVALS):
+        keys = [f["key"] + "_test" for f in FESTIVALS]
+        if not any(k in self.cfg for k in keys):
             return False
-        for f in FESTIVALS:
-            self.cfg[f["key"] + "_test"] = False
+        for k in keys:
+            self.cfg.pop(k, None)
         try:
             save_config(self.cfg)
         except Exception:
@@ -2695,7 +3063,13 @@ class Ticker(QWidget):
         return True
 
     def quit(self):
+        """真正的退出：只有这里才摘监听、停线程、退应用。"""
         self.clear_forced_festivals()
+        if hasattr(self, "_hotkey"):
+            self._hotkey.unregister()      # 不还回去，热键会一直被占着
+        _app = QApplication.instance()
+        if _app is not None:
+            _app.removeEventFilter(self)
         self.fetcher.stop()
         if hasattr(self, "searcher"):
             self.searcher.stop()
@@ -2904,8 +3278,9 @@ def _run():
         return
 
     cfg = load_config()
-    if "codes" not in cfg or not cfg["codes"]:
-        cfg["codes"] = list(DEFAULT_CONFIG["codes"])
+    # 注意：这里**不要**把空的 codes 重置成默认三只。用户删光自选股后存下的
+    # "codes": [] 是合法状态，重启就该还是空；第一次安装时 load_config 已经
+    # 用 DEFAULT_CONFIG 打底，自然会带上默认值。
     snapshot_config()          # 每次启动存一份，作为"上次正常退出时的样子"
     if not os.path.exists(CONFIG_PATH):
         save_config(cfg)
@@ -2920,7 +3295,9 @@ def _run():
     if "--shot" in sys.argv:
         i = sys.argv.index("--shot")
         out = sys.argv[i + 1] if len(sys.argv) > i + 1 else os.path.join(APP_DIR, "shot.png")
-        QTimer.singleShot(5000, lambda: (save_shot(w, out), app.quit()))  # noqa: F821
+        # 走 w.quit() 而不是 app.quit()：后者会跳过 fetcher/searcher 的 stop()，
+        # 退出时大概率报 "QThread destroyed while running"
+        QTimer.singleShot(5000, lambda: (save_shot(w, out), w.quit()))  # noqa: F821
 
     sys.exit(app.exec())
 

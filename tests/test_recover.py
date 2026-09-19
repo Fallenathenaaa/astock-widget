@@ -26,8 +26,11 @@ def chk(n, c, x=""):
 
 tmp = tempfile.mkdtemp(prefix="astock-recover-")
 real_cfg = os.path.join(os.path.dirname(os.path.abspath(W.__file__)), "stocks.json")
-with io.open(real_cfg, encoding="utf-8") as f:
-    REAL = f.read()
+# 不读真实配置：干净 clone 里没有 stocks.json，读了就假失败
+REAL = None
+if os.path.exists(real_cfg):
+    with io.open(real_cfg, encoding="utf-8") as f:
+        REAL = f.read()
 W.CONFIG_PATH = os.path.join(tmp, "stocks.json")
 
 
@@ -90,7 +93,10 @@ chk("返回默认配置", cfg.get("title") == W.DEFAULT_CONFIG["title"])
 chk("没去翻备份", W._recovered_from is None)
 
 print("== 7. 真实配置未被改动 ==")
-chk("真实 stocks.json 原样", io.open(real_cfg, encoding="utf-8").read() == REAL)
+if REAL is None:
+    print("  SKIP  本机没有 stocks.json（干净 checkout 的正常状态）")
+else:
+    chk("真实 stocks.json 原样", io.open(real_cfg, encoding="utf-8").read() == REAL)
 
 print("\n%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

@@ -29,15 +29,19 @@ def chk(n, c, x=""):
 
 
 tmp = tempfile.mkdtemp(prefix="astock-reg-")
+# 关键：测试不能依赖开发者机器上那份真实的 stocks.json。干净 clone 里没有它，
+# 测试会假失败；而且万一哪天它格式变了，回归结果就不可信了。一律用默认配置打底。
 real_cfg = os.path.join(os.path.dirname(os.path.abspath(W.__file__)), "stocks.json")
-with io.open(real_cfg, encoding="utf-8") as f:
-    REAL = f.read()
+REAL = None
+if os.path.exists(real_cfg):
+    with io.open(real_cfg, encoding="utf-8") as f:
+        REAL = f.read()          # 只在它存在时留个指纹，最后验它没被改动
 W.CONFIG_PATH = os.path.join(tmp, "stocks.json")
-with io.open(W.CONFIG_PATH, "w", encoding="utf-8") as f:
-    f.write(REAL)
 
-CFG = json.loads(REAL)
+CFG = W.validate_config(W.DEFAULT_CONFIG)
 CFG["positions"] = {"sh600519": {"cost": 1250.0, "shares": 100}}
+with io.open(W.CONFIG_PATH, "w", encoding="utf-8") as f:
+    f.write(json.dumps(CFG, ensure_ascii=False, indent=2))
 app = QApplication([])
 # 必须在建 Ticker 之前屏蔽：线程真跑起来的话，退出时 Qt 会"QThread destroyed while running" 直接 abort（0xC0000409）
 W.Fetcher.start = lambda self: None
@@ -50,7 +54,7 @@ def key(k):
 
 
 print("== 版本号 ==")
-chk("APP_VERSION = v2.0.1", W.APP_VERSION == "v2.0.1", W.APP_VERSION)
+chk("APP_VERSION = v2.1.0", W.APP_VERSION == "v2.1.0", W.APP_VERSION)
 
 print("== 渲染冒烟 ==")
 w.rows = [
@@ -145,33 +149,52 @@ w._dot_taps_at = time.time() - W.DOT_TAP_WINDOW - 1   # 中间停了超过窗口
 tap()
 chk("点太慢 → 不算数", w._unlocked is False)
 
-print("== 退出清空强制特效 ==")
-w.cfg["valentine_test"] = True
-w.cfg["christmas_test"] = True
-changed = w.clear_forced_festivals()
-chk("退出时清掉了强制开关", changed is True)
-chk("一个强制开关都不剩",
-    not any(w.cfg.get(f["key"] + "_test") for f in W.FESTIVALS))
-chk("没开开关时不算改动", w.clear_forced_festivals() is False)
-for f in W.FESTIVALS:
-    w.cfg[f["key"] + "_test"] = True
-w.clear_forced_festivals()
-chk("全开也能一次清干净",
-    not any(w.cfg.get(f["key"] + "_test") for f in W.FESTIVALS))
+print("== 强制节日是运行时状态，不落盘 ==")
+# 强制开关只活在内存里：崩溃 / 强杀之后下次启动必须回到"按日期自动触发"，
+# 不能像以前那样从 stocks.json 里把上次的强制特效读回来。
+w.toggle_festival("valentine")
+chk("开一个 → 生效", w._festival() is not None and w._festival()["key"] == "valentine",
+    w._festival()["key"] if w._festival() else None)
+chk("开着的那个不进配置", not any(
+    f["key"] + "_test" in w.cfg for f in W.FESTIVALS))
+chk("落盘的配置里没有强制开关",
+    not any(k.endswith("_test")
+            for k in json.loads(io.open(W.CONFIG_PATH, encoding="utf-8").read())))
+w.toggle_festival("valentine")
+chk("再点一次 = 关掉", w._festival() is None)
+w.toggle_festival("midautumn")
+w.toggle_festival("national")
+chk("同一时刻只留一个（后点的那个）",
+    w._festival() is not None and w._festival()["key"] == "national",
+    w._festival()["key"] if w._festival() else None)
+w.clear_festivals()
+chk("全部关闭 → 回到按日期", w._forced_festival is None)
 
 print("== 节日判断 ==")
-w.cfg.update({"midautumn_test": False, "national_test": False, "spring_test": False})
+# _need_anim 还叠了"窗口不可见就不画"这一层，这里单独测节日本身
 w._konami_show = 0.0          # 上面敲过口令，进度点还在显示期，会误判成"有动画"
-chk("平时不开动画", w._need_anim() is False)
-w.cfg["midautumn_test"] = True
-chk("中秋测试 → 要动画", w._need_anim() is True)
-w.cfg["midautumn_test"] = False
-w.cfg["national_test"] = True
-chk("国庆测试 → 要动画", w._need_anim() is True)
-w.cfg["national_test"] = False
-w.cfg["spring_test"] = True
-chk("春节测试 → 要动画", w._need_anim() is True)
-w.cfg["spring_test"] = False
+w._forced_festival = None
+chk("平时没有节日", w._festival() is None)
+w._forced_festival = "midautumn"
+chk("强制中秋 → 要动画", w._need_anim() is True)
+w._forced_festival = "national"
+chk("强制国庆 → 要动画", w._need_anim() is True)
+w._forced_festival = "spring"
+chk("强制春节 → 要动画", w._need_anim() is True)
+w._forced_festival = None
+chk("关掉后不要动画", w._need_anim() is False)
+w._forced_festival = "midautumn"
+chk("藏起来时不画动画（省 CPU）", (w.hide(), w._need_anim())[1] is False)
+w._forced_festival = None
+
+print("== 清理历史遗留字段 ==")
+# 老版本把"强制开启"写进过 stocks.json，新版本要能把这些残留键删掉
+for f in W.FESTIVALS:
+    w.cfg[f["key"] + "_test"] = True
+chk("有残留时能识别", w.clear_forced_festivals() is True)
+chk("一个残留键都不剩",
+    not any(f["key"] + "_test" in w.cfg for f in W.FESTIVALS))
+chk("没残留时不算改动", w.clear_forced_festivals() is False)
 
 print("== 农历 ==")
 chk("2026 中秋 = 9/25", str(W.lunar_to_solar(2026, 8, 15)) == "2026-09-25",
@@ -246,7 +269,10 @@ chk("能生成快照", bool(p) and os.path.exists(p))
 chk("快照目录跟着 CONFIG_PATH", os.path.dirname(p) == os.path.join(tmp, "backups"), p)
 
 print("== 真实配置未被改动 ==")
-chk("真实 stocks.json 原样", io.open(real_cfg, encoding="utf-8").read() == REAL)
+if REAL is None:
+    print("  SKIP  本机没有 stocks.json（干净 checkout 的正常状态）")
+else:
+    chk("真实 stocks.json 原样", io.open(real_cfg, encoding="utf-8").read() == REAL)
 real_bak = os.path.join(os.path.dirname(real_cfg), "backups")
 _before = set(os.listdir(real_bak)) if os.path.isdir(real_bak) else set()
 chk("真实 backups/ 未被测试新增文件",

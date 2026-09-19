@@ -2,7 +2,7 @@
 
 > 半透明、置顶、可拖动的 Windows 11 桌面小挂件。最多盯 5 只 A 股，实时刷新，带分时走势缩略图，顶部常驻大盘指数，涨跌超阈值自动提醒。
 
-当前版本：**v2.0.1**
+当前版本：**v2.1.0** · 更新于 2026-09-19 · [下载](https://github.com/Fallenathenaaa/astock-widget/releases/tag/v2.1.0)
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 收盘彩蛋（v1.2.0+）
 
-![收盘彩蛋](screenshots/preview-effect-fire-frost.png?v=2)
+![收盘彩蛋](screenshots/preview-effect-fire-frost.png?v=3)
 
 每天 **14:57** 集合竞价那一刻定格一次：
 
@@ -21,17 +21,17 @@
 
 | 0% 透明 · 浅色壁纸下的彩蛋 |
 |---|
-| ![ghost effect](screenshots/preview-effect-ghost-light.png?v=2) |
+| ![ghost effect](screenshots/preview-effect-ghost-light.png?v=3) |
 
 ### 默认外观（75% 透明度）
 
-![75% 透明度](screenshots/preview-normal.png?v=2)
+![75% 透明度](screenshots/preview-normal.png?v=3)
 
 深灰半透明面板，红涨绿跌，右侧是分时迷你走势图。
 
 ### 多选删除股票（v1.1.0）
 
-![多选删除](screenshots/preview-multi-select.png?v=2)
+![多选删除](screenshots/preview-multi-select.png?v=3)
 
 右键任意一只股票、或长按 0.5 秒，即可进入多选模式。每行左侧出现复选框，底部出现 `删除(N)` 和 `取消` 按钮。点击行切换勾选，按 Esc 或右键空白退出。
 
@@ -39,11 +39,11 @@
 
 | 0% 透明 · 深色壁纸 | 0% 透明 · 浅色壁纸 |
 |---|---|
-| ![ghost dark](screenshots/preview-ghost-dark.png?v=2) | ![ghost light](screenshots/preview-ghost-light.png?v=2) |
+| ![ghost dark](screenshots/preview-ghost-dark.png?v=3) | ![ghost light](screenshots/preview-ghost-light.png?v=3) |
 
 | 100% 不透明 |
 |---|
-| ![opaque](screenshots/preview-opaque.png?v=2) |
+| ![opaque](screenshots/preview-opaque.png?v=3) |
 
 **0% 透明模式**（俗称"幽灵模式"）下背景完全消失，只剩文字浮在壁纸上。此时程序会：
 
@@ -58,13 +58,13 @@
 
 | 85% 缩放 | 130% 缩放 |
 |---|---|
-| ![85](screenshots/preview-85.png?v=2) | ![130](screenshots/preview-130.png?v=2) |
+| ![85](screenshots/preview-85.png?v=3) | ![130](screenshots/preview-130.png?v=3) |
 
 等比缩放——字号、行高、间距、窗口整体一起变，不会出现"字大了挤成一团"。可选 85% / 标准 / 115% / 130%。
 
 ### 搜索加自选
 
-![search](screenshots/preview-search.png?v=2)
+![search](screenshots/preview-search.png?v=3)
 
 标题右边的输入框支持拼音缩写、全拼、代码、中文名四种输入。
 
@@ -72,7 +72,20 @@
 
 ## 版本特点
 
-### v2.0.1（当前）
+### v2.1.0（当前）
+
+**正确性加固 + 数据源模块化**
+
+- 🆔 **股票身份用完整代码**：`sh000001`（上证指数）和 `sz000001`（平安银行）的 6 位代码都是 `000001`，以前按下标/代码配对会串股。现在身份直接来自接口返回的变量名，漏返回一只或返回顺序变了都不会错位
+- ⏱ **异步结果有版本号**：换自选股后旧的行情会被丢弃；搜索结果带关键字和编号，改了词或按了 Esc 之后旧结果不会再弹回来
+- 🕘 **一律北京时间**：系统时区被改过、或者在海外，也不会把实盘判成休市；补了 2026 年官方休市日表
+- 🔔 **异动提醒不再重复**：只在交易时段提醒，且是边沿触发（回到安全区才重新武装），收盘后不会每 60 秒弹同一条
+- 🎆 **收盘彩蛋改成窗口触发**：14:57–15:00 内第一次拿到当天行情就触发，不再只认 14:57 那一分钟
+- 🧩 **双数据源**：腾讯主源 + 新浪备源，主源挂了自动降级；搜索结果只留沪深京 A 股 / 指数 / ETF
+- 🧪 **测试从干净 checkout 也能跑**：不再依赖开发者机器上那份 `stocks.json`
+- 🔍 **发布卫生检查**：扫私有路径 / token / 带凭据 URL，并用 AST 检查"同一个类里有没有同名方法"
+
+### v2.0.1
 
 **安全收紧 + 文档图修复**
 
@@ -234,23 +247,25 @@ v1.2.0 上线了收盘彩蛋。后续三个小版本反复打磨观感：
 
 ### 方式一：下载即用（推荐）
 
-1. 到 [Releases](../../releases) 下载最新的 `astock-widget-v2.0.1.zip`
+1. 到 [Releases](../../releases) 页面，下载 **Source code (zip)**
 2. 解压到任意目录（建议不要放 C 盘需要权限的位置）
-3. 双击 `start.bat`
+3. 双击 `install.bat`（建 `.venv` 并按 `requirements.txt` 装依赖，**只需一次**）
+4. 双击 `start.bat`
 
-`start.bat` 会**先检查 PySide6 在不在，缺了就自动从阿里云镜像装**，装完再启动，所以换台电脑也能用。
+> Release 里没有额外的打包产物，只有源码压缩包；依赖装在项目自己的 `.venv` 里，不污染全局 Python，换台机器拷过去也能跑。
 
 ### 方式二：从源码运行
 
 ```bash
-# 1. 装依赖（只装一个 PySide6）
-pip install PySide6 -i https://mirrors.aliyun.com/pypi/simple/
+# 1. 建虚拟环境并装依赖（只装一个 PySide6）
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
 # 2. 复制示例配置
 cp stocks.example.json stocks.json
 
 # 3. 启动
-pythonw widget.py
+.venv\Scripts\pythonw.exe widget.py
 ```
 
 > 也可以直接双击 `install.bat` 单独装依赖。
@@ -258,7 +273,7 @@ pythonw widget.py
 ### 环境要求
 
 - Windows 10 / 11（Windows 11 上效果最佳）
-- Python 3.8+（只依赖 PySide6）
+- Python 3.10 – 3.14（只依赖 PySide6==6.11.2）
 
 ---
 
@@ -296,7 +311,7 @@ pythonw widget.py
 
 | 三行一一对应 |
 |---|
-| ![demo](screenshots/preview-demo.png?v=2) |
+| ![demo](screenshots/preview-demo.png?v=3) |
 
 - 贵州茅台 1500.00 / **+6.21% / 红色** → 🔥 火焰彩蛋
 - 平安银行 11.00 / **−5.28% / 绿色** → ❄ 冰霜彩蛋
@@ -454,16 +469,25 @@ sh600519        → sh600519
 ## 开发 / 测试
 
 ```bash
-python run_tests.py              # 跑全部（161 项）
+python run_tests.py              # 跑全部
+python tests/test_clock.py       # 也可以只跑一个文件
 ```
 
-| 文件 | 项数 | 覆盖 |
-|---|---|---|
-| `test_regress.py` | 45 | 综合回归：渲染 / 菜单 / 找窗口 / 单实例 |
-| `test_backup.py` | 23 | 配置备份：生成 / 去重 / 轮转 / 恢复 / 坏文件 |
-| `test_crash.py` | 19 | 崩溃兜底：日志落盘 / 轮转 / 三层 hook / main 兜底 |
-| `test_snap.py` | 18 | 边缘吸附：四边 / 阈值边界 / 四角 / 开关 / 多显示器 |
-| `test_recover.py` | 15 | 配置损坏自动回滚：损坏恢复 / 备份全坏 / 全新安装 |
+| 文件 | 覆盖 |
+|---|---|
+| `test_regress.py` | 综合回归：渲染 / 菜单 / 找窗口 / 单实例 / 运行时开关状态 |
+| `test_market_core.py` | 行情核心：代码归一化 / 完整代码身份 / 漏返回与乱序 / 脏数据 |
+| `test_provider_fixtures.py` | 用真实接口返回跑解析：字段位置漂移 / 品种覆盖 / 搜索过滤 |
+| `test_async_state.py` | 异步状态：generation 丢弃旧行情 / 搜索 seq / 空自选 / 提醒去重 |
+| `test_clock.py` | 交易时段：7 个阶段 / 北京时间 / 2026 官方休市日 / 截至日期 |
+| `test_source.py` | 数据源：涨跌停推算 / 停牌判定 / 代码分类 / 降级调度 / 老板键 |
+| `test_release_hygiene.py` | 发布卫生：私有路径 / token / 版本一致性 / 同类同名方法 |
+| `test_config_schema.py` | 配置校验：脏类型 / 越界 / 可选集合 / 原子写入 / worker 停机 |
+| `test_calendar.py` | 日期触发规则：触发日算法 / 单激活 / 表完整性 |
+| `test_backup.py` | 配置备份：生成 / 去重 / 轮转 / 恢复 / 坏文件 |
+| `test_crash.py` | 崩溃兜底：日志落盘 / 轮转 / 三层 hook / main 兜底 |
+| `test_snap.py` | 边缘吸附：四边 / 阈值边界 / 四角 / 开关 / 多显示器 |
+| `test_recover.py` | 配置损坏自动回滚：损坏恢复 / 备份全坏 / 全新安装 |
 
 几个约定：
 
@@ -471,11 +495,14 @@ python run_tests.py              # 跑全部（161 项）
 - `offscreen` 平台，不需要显示器
 - 用例全过但**进程退出码非 0 也算失败** —— 专门用来抓"QThread 还在跑就被销毁，Qt 直接 abort（0xC0000409）"这类退出时的问题
 - 建 `Ticker` 之前要先屏蔽 `Fetcher.start` / `Searcher.start`，否则线程会在退出时把进程带崩
+- `tests/fixtures/` 存的是**真实抓回来的接口响应**（`test_provider_fixtures.py` 用它跑解析）。接口改字段顺序会立刻红 —— 手写样例做不到这点，因为接口改了它也照样通过
 
 ### tools/ 小工具
 
 ```bash
 python tools/selfcheck.py        # 静态自检：未使用 import / 死代码 / 编译 / 超长函数
+python tools/release_check.py    # 发版前检查：测试 / 自检 / 编译 / 版本一致 / 无私有路径
+python tools/capture_fixtures.py # 重抓一份真实接口响应，存进 tests/fixtures/
 python tools/measure_size.py     # 体积报告（行数 / 字节数 / 运行时内存快照）
 python tools/usage_sampler.py --pid <PID> --duration 1800 --interval 30
                                  # 30 分钟占用采样 → usage_report.csv / .json
@@ -487,13 +514,28 @@ python tools/push_github.py      # 走 GitHub Git Data API 推送（绕开代理
 
 ## 数据源
 
-腾讯财经公开行情接口，无需 Key：
+公开行情接口，无需 Key。默认**自动**，主源挂了自动降级到备源：
 
-- 实时行情：`qt.gtimg.cn`
-- 分时数据：`web.ifzq.gtimg.cn`
-- 股票搜索：`smartbox.gtimg.cn`
+| 源 | 实时行情 | 分时数据 | 股票搜索 |
+|---|---|---|---|
+| 腾讯财经（主） | `qt.gtimg.cn` | `web.ifzq.gtimg.cn` | `smartbox.gtimg.cn` |
+| 新浪财经（备） | `hq.sinajs.cn` | `quotes.sina.cn` | `suggest3.sinajs.cn` |
 
-行情有约 0~3 秒延迟。
+- 右键 →「数据源」可手动指定：自动 / 腾讯 / 新浪
+- 自动模式会记住上次成功的源，下次优先用它（少一次失败往返）
+- 两个源字段不一样（新浪没有涨跌停价，按板块规则推算），已在 `providers.py` 里归一
+- 行情有约 0~3 秒延迟，仅供参考，不构成投资建议
+
+---
+
+## 隐私
+
+- **不采集、不上传任何数据。** 没有埋点、没有使用统计、没有崩溃自动上报。
+- 唯一的对外网络请求是**拉取行情**：只 GET 上面那几个公开接口，请求里不带任何本机信息。
+- 自选股和持仓成本只存在本机的 `stocks.json`，**默认不入库**（`.gitignore` 已排除）。
+- 崩溃日志只写本机 `logs/`，不会自动发送 —— 要反馈得你自己拿出来。
+- 开机自启只写当前用户的注册表 Run 项，不碰系统目录，不需要管理员权限。
+- 源码完全公开，可以自己核对以上每一条。
 
 ---
 
@@ -515,12 +557,11 @@ python tools/push_github.py      # 走 GitHub Git Data API 推送（绕开代理
 
 | 目录 | 大小 | 文件数 | 运行要不要 |
 |---|---|---|---|
-| `tests/` | 29.8 KB | 7 | ❌ 开发用 |
-| `tools/` | 25.0 KB | 5 | ❌ 开发用 |
-| `screenshots/` | 1.25 MB | 38 | ❌ 只给 README 配图 |
-| `.git/` | 3.35 MB | 115 | ❌ 版本历史 |
+| `tests/` | 98 KB | 22 | ❌ 开发用 |
+| `tools/` | 71 KB | 16 | ❌ 开发用 |
+| `screenshots/` | 749 KB | 17 | ❌ 只给 README 配图 |
 
-**真正跑起来只需要 `widget.py` 113.1 KB + `stocks.json` 0.5 KB = 113.6 KB。**
+**真正跑起来只需要 `widget.py` 135 KB + `stocks.json`（首次运行自动生成）。**
 
 第三方依赖只有 **PySide6** 一个（那是环境依赖，不算本项目体积）。
 

@@ -5,8 +5,14 @@ stocks.json
 backups/
 logs/
 
-# 本地笔记：写了解锁隐藏菜单的方法，不对外
+# 本地笔记：只在本机看，不对外
 LOCAL-NOTES.md
+
+# 内部工作记录：含未对外公开的实现细节和残留问题清单，不跟着发
+docs/
+
+# 未对外公开的效果留档图，只在本机看
+local-shots/
 
 # Python
 __pycache__/
