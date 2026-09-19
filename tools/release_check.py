@@ -25,6 +25,11 @@ import re
 import subprocess
 import sys
 
+# 同上：Windows 控制台不默认 UTF-8，打中文会 UnicodeEncodeError（CI 上踩过）
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
 

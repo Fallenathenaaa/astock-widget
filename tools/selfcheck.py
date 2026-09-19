@@ -10,6 +10,11 @@ import shutil
 import tempfile
 import py_compile
 
+# 同上：Windows 控制台不默认 UTF-8，打中文会 UnicodeEncodeError（CI 上踩过）
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 TMPDIR = tempfile.mkdtemp(prefix="selfcheck-")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)

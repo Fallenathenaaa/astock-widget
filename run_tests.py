@@ -11,6 +11,15 @@ import os
 import subprocess
 import sys
 
+# Windows 控制台默认不是 UTF-8（中文机器是 cp936，英文机器是 cp1252），
+# 往 stdout 打中文会直接 UnicodeEncodeError —— GitHub 的 windows-latest
+# runner 就是 cp1252，第一次上 CI 就挂在这儿，本地却完全正常。
+# 所以：自己先切成 UTF-8，再让每个子进程也用 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = os.path.join(HERE, "tests")
 PY = sys.executable

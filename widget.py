@@ -21,6 +21,14 @@ import threading
 from ctypes import wintypes
 from datetime import datetime, timedelta
 
+# Windows 控制台不默认 UTF-8：中文机器是 cp936，英文机器是 cp1252。
+# 往 stdout 打中文时 cp1252 会抛 UnicodeEncodeError —— GitHub 的
+# windows-latest runner 就是 cp1252，第一次上 CI 测试全崩在这儿。
+# 切成 UTF-8 之后，任何 import 本模块的进程（包括每个测试文件）都跟着受益。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QRect, QPointF,
                             QLineF, QTimer, QEvent, QAbstractNativeEventFilter)
 from PySide6.QtGui import (
