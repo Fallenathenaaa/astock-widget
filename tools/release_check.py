@@ -96,7 +96,18 @@ def main():
         readme = io.open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
     except Exception:
         readme = ""
-    require("README 里有当前版本 %s" % ver, bool(ver) and ver in readme, ver)
+    # 精确匹配「当前版本：**vX.Y.Z**」这一处，不是全篇找子串。
+    # 子串匹配会让 "v2.1.1" 在写着 v2.1.10 的页面上"通过"，也会因为正文里
+    # 随便一句历史版本号就误判为已更新 —— 那等于没检查。
+    m_ver = re.search(r"当前版本：\*\*(v\d+\.\d+\.\d+)\*\*", readme)
+    require("README 顶部的「当前版本」就是 %s" % ver,
+            bool(ver) and m_ver is not None and m_ver.group(1) == ver,
+            (m_ver.group(1) if m_ver else "没找到「当前版本：**vX.Y.Z**」"))
+    # 下载链接必须指着同一个 tag，否则用户点进去拿到的是别的版本
+    m_dl = re.search(r"releases/tag/(v\d+\.\d+\.\d+)", readme)
+    require("README 的下载链接指着 %s" % ver,
+            bool(ver) and m_dl is not None and m_dl.group(1) == ver,
+            m_dl.group(1) if m_dl else "没找到 releases/tag/ 链接")
 
     # ------------------------------------------------------------ 1. 测试
     rc, out = run([PY, "run_tests.py"])

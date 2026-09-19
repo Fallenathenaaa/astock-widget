@@ -45,7 +45,7 @@ import providers
 from providers import HALT, LIMIT_UP, LIMIT_DN
 
 APP_NAME = "A股桌面盯盘挂件"
-APP_VERSION = "v2.1.1"
+APP_VERSION = "v2.1.2"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "stocks.json")
@@ -621,7 +621,10 @@ DEFAULT_CONFIG = {
     "unlocked": False,          # 隐藏菜单是否已解锁（输对一次口令后记住，免得每次重启重输）
     "snap": True,               # 拖动时吸附到屏幕边缘
     "pos": None,
-    "data_source": "auto",      # 行情数据源："auto" = 主源挂了自动换备源
+    # 行情数据源："auto" = 优先主源，主源挂了自动换备源。
+    # 手选 tencent / sina 是"优先谁"，不是"只准谁"：手选的那个一条都给不出来时
+    # 照样降级，界面上不会因此变成一片空白。
+    "data_source": "auto",
     "boss_key": DEFAULT_BOSS_KEY,   # 老板键：一键隐藏/恢复，空串 = 关闭
 }
 
@@ -658,6 +661,26 @@ def _to_bool(v, default):
         if s in ("false", "0", "no", "off"):
             return False
     return default
+
+
+def _finite_number(v):
+    """转成有限实数：不是数字 / NaN / ±inf → None。
+
+    和 _finite_positive 的差别只是不要求为正：**先判有限，再谈范围**。
+
+    为什么必须专门挡 inf：JSON 标准允许写 `1e999`，`json.loads` 会老老实实
+    把它解析成 `float('inf')`；而 `int(float('inf'))` 抛的是 **OverflowError**，
+    既不是 TypeError 也不是 ValueError —— 以前 validate_config 只兜这两个，
+    于是一个 `bg_alpha: 1e999` 就能把整份配置推翻回默认值（别的字段跟着一起丢），
+    违背了"一个字段坏了只回退这一个字段"的设计。
+    """
+    if isinstance(v, bool):
+        return None
+    try:
+        n = float(v)                       # float(10**400) 也是 OverflowError
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if math.isfinite(n) else None
 
 
 def _finite_positive(v):
@@ -706,6 +729,54 @@ def sanitize_positions(raw):
     return out
 
 
+def _valid_source_keys():
+    """配置文件里 data_source 允许写的值：auto + 每个已注册源的 key。"""
+    return {"auto"} | {k for k, _ in providers.SOURCE_CHOICES if k}
+
+
+def _validated_str(key, v):
+    """字符串字段的收紧：标题截长度，枚举类的字段必须落在白名单里。
+
+    data_source 以前只做 `str(v)` —— 写成 "tencentt"（多个 t）也会被原样收下，
+    接着 `order("tencentt")` 谁都匹配不上，静默退化成"按注册顺序走"，
+    表现就是"我明明手选了腾讯，怎么还在用新浪"。认不出来就回 auto。
+
+    boss_key 同理：认不出来的组合（"Ctrl+发"、乱拼的）根本注册不了热键，
+    留着它只会得到"按了没反应"，不如回默认那个能用的。
+    """
+    s = str(v)
+    if key == "title":
+        return s[:12]
+    if key == "data_source":
+        return s if s in _valid_source_keys() else DEFAULT_CONFIG["data_source"]
+    if key == "boss_key":
+        return s if (s == "" or parse_hotkey(s)[1]) else DEFAULT_CONFIG["boss_key"]
+    return s
+
+
+def _validated_codes(v, limit=5):
+    """codes 逐条过 normalize_code：写错的代码进不了自选。
+
+    以前只验"是字符串"，于是 "60051"、"600519.SH"（大小写）、"hk00700"
+    都能躺进配置里。它们取不到行情，界面上就是一行永远空白的格子。
+    """
+    if not isinstance(v, (list, tuple)):
+        return None
+    out = []
+    for item in v:
+        if not isinstance(item, str):
+            continue
+        try:
+            full = normalize_code(item)
+        except Exception:
+            full = None
+        if full and full not in out:
+            out.append(full)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def validate_config(raw):
     """把读进来的配置按 DEFAULT_CONFIG 逐项校验。
 
@@ -726,12 +797,12 @@ def validate_config(raw):
             if isinstance(default, bool):
                 out[key] = _to_bool(v, out[key])
             elif isinstance(default, (int, float)):
-                num = float(v)
-                if num != num:                       # NaN
+                num = _finite_number(v)              # NaN / ±inf 都在这层挡掉
+                if num is None:
                     continue
                 out[key] = int(num) if isinstance(default, int) else num
             elif isinstance(default, str):
-                out[key] = str(v)[:12] if key == "title" else str(v)
+                out[key] = _validated_str(key, v)
             elif isinstance(default, list):
                 # 只收字符串：str(x) 会把 None 变成字面量 "None"，那是纯垃圾
                 out[key] = ([x for x in v if isinstance(x, str)][:5]
@@ -745,7 +816,8 @@ def validate_config(raw):
                     out[key] = copy.deepcopy(v) if isinstance(v, dict) else {}
             elif default is None:
                 out[key] = v                          # pos：值要么是 [x, y] 要么是 None，下面再验
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError 必须一起兜：int(1e999) 抛的就是它，不属于 ValueError
             continue                                  # 认不出来就用默认的
     # 取值范围 / 可选集合二次收紧
     out["bg_alpha"] = min(255, max(0, int(out.get("bg_alpha", 190))))
@@ -756,14 +828,17 @@ def validate_config(raw):
             out[key] = DEFAULT_CONFIG[key]
     pos = out.get("pos")
     if pos is not None:
+        # 每一项都要是**有限**实数：inf 是 isinstance(x, float) 的，但 int(inf)
+        # 直接抛 OverflowError，会把整份配置带崩（窗口还会被挪到屏幕外）
         ok = (isinstance(pos, (list, tuple)) and len(pos) == 2
-              and all(isinstance(x, (int, float)) for x in pos))
-        out["pos"] = [int(pos[0]), int(pos[1])] if ok else None
-    codes = out.get("codes")
-    if isinstance(codes, list):
-        # 空串和 None 也得剔掉：上面 str(x) 会把 None 变成字面量 "None"
-        out["codes"] = [c for c in dict.fromkeys(codes)
-                        if isinstance(c, str) and c.strip()][:5]
+              and all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                      for x in pos))
+        nums = ([_finite_number(x) for x in pos] if ok else [None, None])
+        out["pos"] = ([int(nums[0]), int(nums[1])]
+                      if nums[0] is not None and nums[1] is not None else None)
+    codes = _validated_codes(out.get("codes"))
+    if codes is not None:
+        out["codes"] = codes
     return out
 
 
@@ -794,13 +869,48 @@ def atomic_write_text(path, text):
     os.replace(tmp, path)
 
 
+_last_save_error = None     # 最近一次写盘失败的原因（UI/自检用）
+_ui_warn_hook = None        # Ticker 起来后注册，把异常弹到托盘上
+
+
+def set_ui_warn_hook(fn):
+    """注册一个「有事要告诉用户」的出口。纯工具调用（没起界面）时保持 None。"""
+    global _ui_warn_hook
+    _ui_warn_hook = fn
+
+
+def _warn_user(msg):
+    """弹一条提示。没界面就只写 stderr —— 至少别当什么都没发生。"""
+    try:
+        sys.stderr.write("[astock] %s\n" % msg)
+    except Exception:
+        pass
+    hook = _ui_warn_hook
+    if hook is not None:
+        try:
+            hook(msg)
+        except Exception:
+            pass
+
+
 def save_config(cfg):
+    """写盘，返回有没有成功。
+
+    以前这里是 `except Exception: pass`：磁盘满 / 文件被占用 / 只读盘 / 权限不够
+    的时候，用户改了一堆设置、退出程序，下次启动全没了 —— 而且**没有任何提示**，
+    看起来就像"设置自己会变回去"。失败了必须让人知道，否则改了白改还怪程序。
+    """
+    global _last_save_error
     try:
         snapshot_config()          # 先把「改动前」这份存下来，写完就晚了
         atomic_write_text(CONFIG_PATH,
                           json.dumps(cfg, ensure_ascii=False, indent=2))
-    except Exception:
-        pass
+    except Exception as e:
+        _last_save_error = "%s: %s" % (type(e).__name__, e)
+        _warn_user("配置保存失败：%s（改动这次没落盘）" % _last_save_error)
+        return False
+    _last_save_error = None
+    return True
 
 
 # ---------------- 配置快照 / 恢复 ----------------
@@ -1069,8 +1179,40 @@ def _accept(full):
     return full if providers.symbol_kind(full) else None
 
 
+def expected_source(cfg_source):
+    """这一轮"正常该用哪个源"：手选了就是手选的，auto 就是注册顺序里第一个。"""
+    s = (cfg_source or "auto").strip()
+    if s and s != "auto":
+        return s
+    return providers.PROVIDERS[0].key if providers.PROVIDERS else ""
+
+
+def source_note(provider, expected):
+    """这一行要不要标出数据来源。不用标就返回空串。
+
+    **只在"这行不是期望那个源给的"时候才有话说。** 正常情况下满屏都是主源的数据，
+    每行都挂一个"腾讯"是纯噪音，还挤占本来就不宽的行。值得标的是"主源这次没给全、
+    由备源补上"的那几行 —— 那既是"主源出状况了"的信号，也顺带提醒这行的字段可能
+    少一些（比如涨跌停价是推算的）。
+
+    认不出来的源名（改过 key / 老配置）一律不标，宁可少说也别画出怪东西。
+    """
+    if not provider or not expected or provider == expected:
+        return ""
+    for p in providers.PROVIDERS:
+        if p.key == provider:
+            return p.label
+    return ""
+
+
 def parse_positions(text):
-    """"600519=1250:100, 000001=11.5" -> {"sh600519": {"cost":1250.0,"shares":100}, ...}"""
+    """"600519=1250:100, 000001=11.5" -> {"sh600519": {"cost":1250.0,"shares":100}, ...}
+
+    最后统一交给 sanitize_positions 过一遍。以前只有**读文件**那条路才校验，
+    手工在这儿写出来的 "600519=nan" / "600519=-10" / "600519=1000:-100"
+    能直接进 self.cfg —— 成本是 nan 时盈亏那行画出来是 "nan 元"，负数股数
+    能把盈亏翻号；只有重启（重新读盘）才被清掉。校验不能只装在一条路上。
+    """
     pos = {}
     for item in str(text).replace("，", ",").replace("、", ",").replace(" ", "").split(","):
         if "=" not in item:
@@ -1080,18 +1222,16 @@ def parse_positions(text):
         if not code or not val:
             continue
         parts = val.split(":")
-        try:
-            cost = float(parts[0])
-        except ValueError:
+        cost = _finite_number(parts[0])
+        if cost is None:
             continue
         entry = {"cost": cost}
         if len(parts) > 1 and parts[1]:
-            try:
-                entry["shares"] = int(float(parts[1]))
-            except ValueError:
-                pass
+            shares = _finite_number(parts[1])
+            if shares is not None:
+                entry["shares"] = int(shares)
         pos[code] = entry
-    return pos
+    return sanitize_positions(pos)
 
 
 # ---------------- 老板键（全局热键） ----------------
@@ -1099,6 +1239,7 @@ WM_HOTKEY = 0x0312
 HOTKEY_ID = 0xA571          # 自己挑的 id，只在本进程内有效
 
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x0001, 0x0002, 0x0004, 0x0008
+MOD_NOREPEAT = 0x4000          # 按住不放时只报一次，别按键盘重复率狂发
 
 _MODS = {"alt": MOD_ALT, "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
          "shift": MOD_SHIFT, "win": MOD_WIN}
@@ -1158,7 +1299,10 @@ class HotkeyFilter(QAbstractNativeEventFilter):
         u32.RegisterHotKey.argtypes = [wintypes.HWND, wintypes.INT,
                                        wintypes.UINT, wintypes.UINT]
         u32.RegisterHotKey.restype = wintypes.BOOL
-        if not u32.RegisterHotKey(None, HOTKEY_ID, mod, vk):
+        # MOD_NOREPEAT：按住不放时系统只发一次 WM_HOTKEY，而不是按着键盘的
+        # 自动重复率狂发。老板键是 hide/show 切换，收到一串重复消息就会
+        # 藏-显-藏-显 地闪 —— 按住不放的那几秒里窗口像在抽搐。
+        if not u32.RegisterHotKey(None, HOTKEY_ID, mod | MOD_NOREPEAT, vk):
             return False                # 组合键被别的程序占了
         self.registered = (mod, vk)
         return True
@@ -2380,6 +2524,17 @@ class Ticker(QWidget):
         nx = 14 + ox + fm.horizontalAdvance(name) + 6
         self._text(p, QRect(nx, y + 7, 60, 16), Qt.AlignVCenter | Qt.AlignLeft, r["code"], self._fg_fade())
 
+        # 这行不是期望的源给的 → 代码后面跟一个灰色小字。正常时一个字都不画：
+        # 满屏都是同一个源名是噪音，不是信息；只有"主源没给全、备源补的"才值得说。
+        note = source_note(r.get("provider"), expected_source(self.cfg.get("data_source")))
+        if note:
+            cw = QFontMetrics(QFont("Microsoft YaHei", 7)).horizontalAdvance(r["code"])
+            tx = nx + cw + 5
+            # 别撞上右边的状态徽标（停牌 / 涨停 / 跌停），撞上就不画
+            if tx + 34 <= w - 14 - 58 - 32:
+                self._text(p, QRect(tx, y + 7, 34, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                           note, self._fg_fade(), ol)
+
         # 停牌 / 涨停 / 跌停：涨跌幅左边挂个实心小标签，一眼能看出来
         if status != providers.NORMAL:
             self._draw_status_badge(p, status, color, w - 14 - 58 - 30, y + 6)
@@ -3210,6 +3365,11 @@ class Ticker(QWidget):
         tm.addAction("退出").triggered.connect(self.quit)
         self.tray.setContextMenu(tm)
         self.tray.show()
+        # 托盘起来之后，写盘失败之类的事就能弹出来告诉用户了
+        # （singleShot：save_config 也可能被非 UI 线程调到）
+        set_ui_warn_hook(
+            lambda m: QTimer.singleShot(0, lambda: self.tray.showMessage(
+                "A股盯盘", m, QSystemTrayIcon.Warning, 8000)))
 
     def _on_tray_activated(self, reason):
         """托盘左键 = 显示 / 隐藏（README 就是这么写的，以前只做了 showNormal）"""

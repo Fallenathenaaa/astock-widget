@@ -98,7 +98,8 @@ chk("ui_scale=0.5 不在集合里 → 退回默认",
 print("== 自选股去重 / 截断 / 去空 ==")
 out = W.validate_config({"codes": ["sh600519", "sh600519", "sz000001", "", None]})
 chk("重复只留一次", out["codes"] == ["sh600519", "sz000001"], out["codes"])
-out = W.validate_config({"codes": ["1", "2", "3", "4", "5", "6", "7"]})
+out = W.validate_config({"codes": ["sh600519", "sz000001", "sz300750", "sh000001",
+                                   "sz399001", "sh515220", "sh588000"]})
 chk("最多 5 只", len(out["codes"]) == 5, out["codes"])
 chk("非字符串被剔除",
     all(isinstance(c, str) for c in out["codes"]), out["codes"])
@@ -209,6 +210,130 @@ chk("代码会归一化成完整代码",
     W.validate_config({"positions": {"600519": {"cost": 10.0}}})["positions"]
     == {"sh600519": {"cost": 10.0}},
     W.validate_config({"positions": {"600519": {"cost": 10.0}}})["positions"])
+
+print("== codes 必须是认得出来的证券代码 ==")
+chk("带市场的写法保留", W.validate_config({"codes": ["sh600519"]})["codes"] == ["sh600519"])
+chk("纯 6 位归一成完整代码",
+    W.validate_config({"codes": ["600519"]})["codes"] == ["sh600519"])
+chk("交易所后缀也认",
+    W.validate_config({"codes": ["600519.SH"]})["codes"] == ["sh600519"])
+# 以前只验"是字符串"，这些都进得了配置，取不到行情就是一行永远空白的格子
+for bad in ["60051", "6005199", "hk00700", "abcdef", "000000", "sh900901", ""]:
+    got = W.validate_config({"codes": [bad]})["codes"]
+    chk("%r 进不了自选" % bad, got == [], got)
+chk("全不合法就是空列表（空自选是合法状态，不回填默认）",
+    W.validate_config({"codes": ["xxx"]})["codes"] == [])
+chk("坏的不连累好的",
+    W.validate_config({"codes": ["600519", "zzz", "sz000001"]})["codes"]
+    == ["sh600519", "sz000001"])
+
+print("== 数值字段：NaN / ±inf 只回退那一个字段 ==")
+# JSON 标准允许 1e999，json.loads 老老实实解析成 inf；int(inf) 抛的是
+# **OverflowError**，以前不在 (TypeError, ValueError) 里 —— 一个字段坏
+# 就能把整份配置推翻，别的字段跟着一起丢。
+out = W.validate_config({"bg_alpha": float("inf"), "title": "别把我弄丢"})
+chk("bg_alpha=inf 不炸且回默认", out["bg_alpha"] == W.DEFAULT_CONFIG["bg_alpha"],
+    out["bg_alpha"])
+chk("一个字段坏了不连累别的字段", out["title"] == "别把我弄丢", out["title"])
+chk("bg_alpha=-inf 同样回默认",
+    W.validate_config({"bg_alpha": float("-inf")})["bg_alpha"]
+    == W.DEFAULT_CONFIG["bg_alpha"])
+chk("bg_alpha=nan 回默认",
+    W.validate_config({"bg_alpha": float("nan")})["bg_alpha"]
+    == W.DEFAULT_CONFIG["bg_alpha"])
+chk("interval=inf 回默认",
+    W.validate_config({"interval": float("inf")})["interval"]
+    == W.DEFAULT_CONFIG["interval"])
+chk("alert_pct=inf 回默认",
+    W.validate_config({"alert_pct": float("inf")})["alert_pct"]
+    == W.DEFAULT_CONFIG["alert_pct"])
+# 真从 JSON 文本走一遍：确认 loads 出来的 inf 也挡得住
+raw = json.loads('{"bg_alpha": 1e999, "alert_pct": -1e999, "title": "从文件来的"}')
+out = W.validate_config(raw)
+chk("json.loads 出的 ±inf 一样挡得住",
+    out["bg_alpha"] == W.DEFAULT_CONFIG["bg_alpha"]
+    and out["alert_pct"] == W.DEFAULT_CONFIG["alert_pct"]
+    and out["title"] == "从文件来的",
+    (out["bg_alpha"], out["alert_pct"], out["title"]))
+chk("_finite_number 基本盘",
+    W._finite_number("3.5") == 3.5 and W._finite_number(float("inf")) is None
+    and W._finite_number(float("nan")) is None and W._finite_number("abc") is None
+    and W._finite_number(True) is None and W._finite_number(None) is None)
+chk("_finite_number 挡得住超大整数", W._finite_number(10 ** 400) is None)
+
+print("== pos 里的 inf 也不能把配置带崩 ==")
+chk("pos 带 inf → None（不是抛异常）",
+    W.validate_config({"pos": [float("inf"), 20]})["pos"] is None)
+chk("pos 半边 inf 也整个丢掉",
+    W.validate_config({"pos": [10, float("-inf")]})["pos"] is None)
+out = W.validate_config({"pos": [float("nan"), 20], "title": "T"})
+chk("pos 带 nan 也丢掉", out["pos"] is None, out["pos"])
+chk("pos 坏了不连累别的字段", out["title"] == "T", out["title"])
+
+print("== 运行时手填持仓也要过一遍 sanitizer ==")
+chk("正常写法",
+    W.parse_positions("600519=1250:100")
+    == {"sh600519": {"cost": 1250.0, "shares": 100}},
+    W.parse_positions("600519=1250:100"))
+# 这几种以前只有在"重启读盘"时才被清掉，手工填写那次能直接进 self.cfg
+for bad in ["nan", "inf", "-inf", "1e999", "-10", "0", "abc"]:
+    got = W.parse_positions("600519=%s" % bad)
+    chk("成本 %r → 整条丢掉" % bad, got == {}, got)
+chk("股数为负 → 只丢股数，成本留着",
+    W.parse_positions("600519=1000:-100") == {"sh600519": {"cost": 1000.0}},
+    W.parse_positions("600519=1000:-100"))
+chk("股数 nan → 只丢股数",
+    W.parse_positions("600519=1000:nan") == {"sh600519": {"cost": 1000.0}},
+    W.parse_positions("600519=1000:nan"))
+chk("代码认不出来 → 丢掉", W.parse_positions("hk00700=10") == {})
+chk("坏的不连累好的",
+    W.parse_positions("600519=nan, 000001=11.5") == {"sz000001": {"cost": 11.5}},
+    W.parse_positions("600519=nan, 000001=11.5"))
+chk("空输入 → 空", W.parse_positions("") == {} and W.parse_positions(None) == {})
+chk("正常那条不会被误伤",
+    W.parse_positions("600519=1250, 000001=11.5:1000")
+    == {"sh600519": {"cost": 1250.0}, "sz000001": {"cost": 11.5, "shares": 1000}},
+    W.parse_positions("600519=1250, 000001=11.5:1000"))
+
+print("== data_source / boss_key 白名单 ==")
+chk("auto 收", W.validate_config({"data_source": "auto"})["data_source"] == "auto")
+for k in [k for k, _ in P.SOURCE_CHOICES if k and k != "auto"]:
+    chk("源 %s 收" % k, W.validate_config({"data_source": k})["data_source"] == k)
+# 拼错的源以前会被原样收下，然后 order(拼错的) 谁都匹配不上 ——
+# 表现就是"我明明手选了腾讯，怎么还在用新浪"
+for bad in ["tencentt", "TENCENT", "", "tx", "sina2", 1, None]:
+    got = W.validate_config({"data_source": bad})["data_source"]
+    chk("源 %r 回 auto" % (bad,), got == "auto", got)
+chk("老板键合法保留", W.validate_config({"boss_key": "F9"})["boss_key"] == "F9")
+chk("老板键关闭保留", W.validate_config({"boss_key": ""})["boss_key"] == "")
+chk("老板键认不出来回默认",
+    W.validate_config({"boss_key": "Ctrl+发"})["boss_key"] == W.DEFAULT_BOSS_KEY)
+chk("老板键裸字母回默认（太容易误触）",
+    W.validate_config({"boss_key": "H"})["boss_key"] == W.DEFAULT_BOSS_KEY)
+
+print("== 写盘失败要说出来，不能静默吞掉 ==")
+_real_write = W.atomic_write_text
+
+
+def boom(path, text):
+    raise OSError(28, "No space left on device")
+
+
+W.atomic_write_text = boom
+try:
+    W.set_ui_warn_hook(None)
+    chk("写盘失败返回 False", W.save_config({"title": "x"}) is False)
+    chk("失败原因被记下来", "No space left" in (W._last_save_error or ""),
+        W._last_save_error)
+    seen = []
+    W.set_ui_warn_hook(seen.append)
+    W.save_config({"title": "x"})
+    chk("失败会通知到用户", len(seen) == 1 and "保存失败" in seen[0], seen)
+finally:
+    W.atomic_write_text = _real_write
+    W.set_ui_warn_hook(None)
+chk("恢复后写盘成功返回 True", W.save_config({"title": "x"}) is True)
+chk("成功后清空上次错误", W._last_save_error is None, W._last_save_error)
 
 print("== worker 停机等待能盖住一次完整降级 ==")
 # 单个源超时 5 秒；自动降级最坏要把两个源都试一遍。等的时间盖不住这个，

@@ -51,13 +51,27 @@ def _num(v, default=0.0):
     return f if f == f else default
 
 
+def _opt_num(v):
+    """字段转 float，但**缺失**和**0**要分开：缺失返回 None，非数字返回 0.0。
+
+    成交量是唯一需要区分的字段：截断响应里根本没有成交量这一列，拿它当 0
+    会让 quote_status 判成"今天一股没成交 → 停牌"，界面上价格直接变 `--`、
+    涨跌额和盈亏一起被藏掉。没给就是没给，不能替它回答"是 0"。
+    """
+    if v is None:
+        return None
+    if isinstance(v, str) and v.strip() == "":
+        return None
+    return _num(v)
+
+
 def _field(f, i):
     """按位置取字段，越界返回空串。
 
     接口偶尔会返回被截断的行：字段数够 35 但不到 49，直接 f[47] 会抛
     IndexError，整轮取数就废了。宁可少拿两个涨跌停价（后面有 guess_limit 兜底）。
     """
-    return f[i] if i < len(f) else ""
+    return f[i] if 0 <= i < len(f) else ""
 
 
 def decimals_of(code):
@@ -89,6 +103,9 @@ def quote_status(price, volume, limit_up, limit_dn):
 
     停牌的判据是「今天该有成交却一股没有」。盘前成交量必然是 0，
     那时不算停牌（见 market_clock.has_session_started）。
+
+    volume 为 None 表示"这一列接口没给"（响应被截断），**不是**成交量为 0，
+    这种情况不许判停牌 —— 那会把一只正常交易的股票显示成停牌。
     """
     if price <= 0:
         return HALT
@@ -96,17 +113,25 @@ def quote_status(price, volume, limit_up, limit_dn):
         return LIMIT_UP
     if limit_dn > 0 and price <= limit_dn + 1e-6:
         return LIMIT_DN
-    if volume <= 0 and market_clock.has_session_started():
+    if volume is not None and volume <= 0 and market_clock.has_session_started():
         return HALT
     return NORMAL
 
 
 def make_quote(full, code, name, price, prev, high=0.0, low=0.0, open_=0.0,
-               volume=0.0, stamp="", limit_up=0.0, limit_dn=0.0):
+               volume=None, stamp="", limit_up=0.0, limit_dn=0.0, provider=""):
     """把各家字段整理成统一结构。昨收都没有说明这行是废数据，返回 None。
 
     full（sh600519 这种带市场的完整代码）是唯一身份：sh000001 和 sz000001
     的 6 位 code 都是 000001，只看 code 会撞车。
+
+    provider 记这行**是谁给的**（"tencent" / "sina"）：一屏里可能混着两个源的
+    数据（主源漏一只、备源补上），出了偏差要能问出"这行是哪个源来的"，
+    不然只能靠猜。
+
+    limit_estimated 记涨跌停价**是不是推算的**：腾讯直接给，新浪不给、由
+    guess_limit 按板块算。算出来的可能和交易所实际（比如 ST 摘帽、临停后
+    调整）不一致，标出来才不会被人当成权威值引用。
     """
     prev = _num(prev)
     if prev <= 0 or not code or not full:
@@ -117,10 +142,11 @@ def make_quote(full, code, name, price, prev, high=0.0, low=0.0, open_=0.0,
     high = _num(high)
     low = _num(low)
     open_ = _num(open_)
-    volume = _num(volume)
+    volume = _opt_num(volume)      # None = 这一列没给，别当成 0
     limit_up = _num(limit_up)
     limit_dn = _num(limit_dn)
-    if limit_up <= 0 or limit_dn <= 0:
+    limit_given = limit_up > 0 and limit_dn > 0
+    if not limit_given:
         limit_up, limit_dn = guess_limit(code, name, prev)
     return {
         "full": full,
@@ -138,6 +164,8 @@ def make_quote(full, code, name, price, prev, high=0.0, low=0.0, open_=0.0,
         "time": stamp or "",
         "limit_up": limit_up,
         "limit_dn": limit_dn,
+        "limit_estimated": not limit_given,
+        "provider": provider or "",
         "status": quote_status(price, volume, limit_up, limit_dn),
     }
 
@@ -186,7 +214,8 @@ class TencentProvider(Provider):
                            # 35 或 36 时直接取 f[36] 会 IndexError，把整只丢掉
                            volume=_field(f, 36), stamp=f[30],
                            limit_up=_num(_field(f, 47)),
-                           limit_dn=_num(_field(f, 48)))
+                           limit_dn=_num(_field(f, 48)),
+                           provider=self.key)
             if q:
                 out.append(q)
         return out
@@ -254,10 +283,14 @@ class SinaProvider(Provider):
             f = line[line.find('="') + 2: line.rfind('"')].split(",")
             if len(f) < 32 or not f[0]:
                 continue
+            # 新浪给股，腾讯给手，统一成手。成交量列是空串时保持 None（没给），
+            # 不要除成 0.0 —— 那会被当成停牌
+            vol = _opt_num(f[8])
             q = make_quote(full, full[2:] or full, f[0], f[3], f[2],
                            high=f[4], low=f[5], open_=f[1],
-                           volume=_num(f[8]) / 100.0,        # 新浪给股，腾讯给手，统一成手
-                           stamp=(f[30] + f[31]).replace("-", "").replace(":", ""))
+                           volume=(None if vol is None else vol / 100.0),
+                           stamp=(f[30] + f[31]).replace("-", "").replace(":", ""),
+                           provider=self.key)
             if q:
                 out.append(q)
         return out
@@ -351,7 +384,11 @@ def _clean_search(recs, limit):
 # ---------------- 调度 ----------------
 
 PROVIDERS = [TencentProvider(), SinaProvider()]
-SOURCE_CHOICES = [("auto", "自动（主源挂了换备源）")] + [(p.key, p.label) for p in PROVIDERS]
+# 手选源的含义是"**优先**用谁"，不是"只准用谁"：手选的那个源一条都给不出来时
+# 仍然会降级到另一个源。刻意保留降级 —— 挂件的作用是看行情，源挂了就什么都不
+# 显示，比"换了个源但数据是对的"糟得多。菜单文案因此写"优先"，不写"只用"。
+SOURCE_CHOICES = [("auto", "自动（优先主源，挂了换备源）")] + [
+    (p.key, "优先" + p.label) for p in PROVIDERS]
 
 
 class ProviderChain:
@@ -396,10 +433,15 @@ class ProviderChain:
 
         want_set = set(want)
         got = {}
+        # last_ok 的语义是"下一轮整批行情优先问谁"，所以只有**本轮第一个真正
+        # 贡献了数据的源**才有资格改写它。主源回来一半、备源回来空 —— 这种情况
+        # 备源没做任何贡献，不能把优先源抢走；只有主源一条都没给时才轮到备源。
+        sticky = None
         for p in self.order(prefer):
             missing = [c for c in want if c not in got]
             if not missing:
                 break
+            before = len(got)
             try:
                 out = getattr(p, method)(missing, *args[1:])
             except Exception as e:
@@ -409,8 +451,10 @@ class ProviderChain:
                 k = item.get("full")
                 if k in want_set and k not in got:
                     got[k] = item
-            if got:
-                self.last_ok = p.key
+            if len(got) > before and sticky is None:
+                sticky = p.key
+        if sticky is not None:
+            self.last_ok = sticky
         if not got and err is not None:
             raise err
         return [got[c] for c in want if c in got]
@@ -432,7 +476,13 @@ def fetch_quotes(codes, prefer="auto"):
 
 
 def search_stocks(keyword, limit=8, prefer="auto"):
-    """搜股票。没结果返回 []（不算失败，不会因此去试下一个源）。"""
+    """搜股票。两个源都空才返回 []。
+
+    注意：这跟"谁先给结果就用谁"不一样 —— 某个源**搜不到**不算它成功，
+    会继续问下一个源。搜索本来就是各家覆盖不同（腾讯按拼音缩写强、新浪按
+    代码强），主源说"没有"不等于真的没有；一个源真的挂了是抛异常，那条路
+    才叫降级。以前这里的注释写反了（写着"不会因此去试下一个源"）。
+    """
     return _SEARCH_CHAIN.call("search", keyword, limit, prefer=prefer) or []
 
 

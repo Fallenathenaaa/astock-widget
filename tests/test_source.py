@@ -66,6 +66,27 @@ chk("昨收为 0 是废数据", P.make_quote("sh600519", "600519", "某某", 1.0
 chk("没有 full 也是废数据", P.make_quote("", "600519", "某某", 1.0, 10.0) is None)
 chk("乱字段不炸", P.make_quote("sh600519", "600519", "某某", "abc", "10.0")["price"] == 0.0)
 
+print("== 来源标记 / 涨跌停价是不是推算的 ==")
+# 一屏里可能混着两个源的数据（主源漏一只、备源补上），出偏差要能问出
+# "这行是谁给的"；涨跌停价有一半的情况是我们自己按板块算的，必须标出来
+q = P.make_quote("sh600519", "600519", "贵州茅台", 11.0, 10.0, volume=100,
+                 limit_up=11.0, limit_dn=9.0, provider="tencent")
+chk("provider 记下来了", q["provider"] == "tencent", q["provider"])
+chk("接口给了涨跌停价 → 不是推算", q["limit_estimated"] is False, q["limit_estimated"])
+q = P.make_quote("sh600519", "600519", "贵州茅台", 11.0, 10.0, volume=100,
+                 provider="sina")
+chk("没给涨跌停价 → 标成推算", q["limit_estimated"] is True, q["limit_estimated"])
+chk("推算值照样算得出来", (q["limit_up"], q["limit_dn"]) == (11.0, 9.0),
+    (q["limit_up"], q["limit_dn"]))
+chk("没传 provider 就是空串（不是 None）",
+    P.make_quote("sh600519", "600519", "某某", 1.0, 1.0)["provider"] == "")
+# 只给了一半（只有涨停价）也算推算：那两个数必须同真同假，不然会算出
+# 一个"涨停有、跌停没有"的畸形区间
+q = P.make_quote("sh600519", "600519", "某某", 1.0, 1.0, limit_up=1.1)
+chk("只给一个涨跌停价 → 整体按推算", q["limit_estimated"] is True, q["limit_estimated"])
+chk("推算时两个价都有值", q["limit_up"] > 0 and q["limit_dn"] > 0,
+    (q["limit_up"], q["limit_dn"]))
+
 print("== 代码分类（搜索白名单）==")
 for full, want in (
     ("sh600519", "stock"), ("sh688981", "stock"), ("sz000001", "stock"),
@@ -189,7 +210,9 @@ chk("三只全回来了", [o["full"] for o in out] == want, [o["full"] for o in 
 chk("按请求顺序返回", [o["full"] for o in out] == want)
 chk("主源被问的是全部", half.asked == [want], half.asked)
 chk("备源只被问缺的那一只", rest.asked == [["sh000002"]], rest.asked)
-chk("补到了就算备源成功过", chain3.last_ok == "rest", chain3.last_ok)
+# 主源自己贡献了两只，优先源就该还是主源 —— 备源只补了一只缺的，
+# 它"没有功劳"，不能把下一轮的优先源抢走（否则下一轮会先去问更慢的备源）
+chk("主源有贡献 → 优先源仍是主源", chain3.last_ok == "half", chain3.last_ok)
 
 # 主源全给了，备源就不该被吵醒
 half2, rest2 = Half(), Rest()
@@ -208,6 +231,97 @@ class Empty(P.Provider):
 out = P.ProviderChain([Half(), Empty()]).call("quotes", want, want=want)
 chk("补不到也不影响已有的两只",
     [o["full"] for o in out] == ["sh000001", "sh000003"], out)
+
+print("== last_ok 的 sticky 语义：谁先给出数据，下一轮就先用谁 ==")
+
+
+class Give(P.Provider):
+    """按构造时给的清单回答：只认问到的代码。"""
+
+    def __init__(self, key, codes):
+        self.key = key
+        self._codes = set(codes)
+        self.asked = []
+
+    def quotes(self, codes):
+        self.asked.append(list(codes))
+        return [{"full": c} for c in codes if c in self._codes]
+
+
+class Down(P.Provider):
+    """一问就抛异常。"""
+
+    def __init__(self, key="down"):
+        self.key = key
+        self.asked = []
+
+    def quotes(self, codes):
+        self.asked.append(list(codes))
+        raise IOError("%s down" % self.key)
+
+
+WANT3 = ["sh000001", "sh000002", "sh000003"]
+
+# 1) 主源给一半 + 备源补上 → 优先源还是主源
+c = P.ProviderChain([Give("a", ["sh000001", "sh000003"]), Give("b", WANT3)])
+c.call("quotes", WANT3, want=WANT3)
+chk("主源部分 + 备源补缺 → 仍是主源", c.last_ok == "a", c.last_ok)
+
+# 2) 主源给一半 + 备源**一条都没给**（返回空）→ 优先源还是主源
+c = P.ProviderChain([Give("a", ["sh000001", "sh000003"]), Give("b", [])])
+out = c.call("quotes", WANT3, want=WANT3)
+chk("备源空手而归 → 数据不受影响", [o["full"] for o in out] == ["sh000001", "sh000003"], out)
+chk("备源没贡献 → 优先源还是主源", c.last_ok == "a", c.last_ok)
+
+# 3) 主源给一半 + 备源**也抛异常** → 优先源还是主源（别被异常源顶掉）
+c = P.ProviderChain([Give("a", ["sh000001", "sh000003"]), Down("b")])
+c.call("quotes", WANT3, want=WANT3)
+chk("备源抛异常 → 优先源还是主源", c.last_ok == "a", c.last_ok)
+
+# 4) 主源一条都没给（返回空）→ 才轮到备源
+c = P.ProviderChain([Give("a", []), Give("b", WANT3)])
+c.call("quotes", WANT3, want=WANT3)
+chk("主源全空 → 切到备源", c.last_ok == "b", c.last_ok)
+
+# 5) 主源抛异常（不是返回空）→ 也算没贡献，切到备源
+c = P.ProviderChain([Down("a"), Give("b", WANT3)])
+c.call("quotes", WANT3, want=WANT3)
+chk("主源挂了 → 切到备源", c.last_ok == "b", c.last_ok)
+
+# 6) 手选源的优先级不受 last_ok 影响：手选谁，谁就站第一个
+c = P.ProviderChain([Give("a", WANT3), Give("b", WANT3)])
+c.last_ok = "b"
+chk("手选源永远排最前（哪怕 last_ok 是另一个）",
+    c.order("a")[0].key == "a", [p.key for p in c.order("a")])
+chk("没手选时才听 last_ok 的", c.order()[0].key == "b", [p.key for p in c.order()])
+chk("auto 等价不手选", c.order("auto")[0].key == "b")
+
+# 7) 手选的源自己挂了 → 仍然降级到备源（这是产品上要的：手选是"优先"，不是"只准"）
+a, b = Down("a"), Give("b", WANT3)
+c = P.ProviderChain([a, b])
+out = c.call("quotes", WANT3, prefer="a", want=WANT3)
+chk("手选源挂了会降级，不是直接空手", [o["full"] for o in out] == WANT3, out)
+chk("降级后优先源记的是备源", c.last_ok == "b", c.last_ok)
+
+print("== 来源标记只在「不是期望的源」时才出现 ==")
+# 界面上不能每行都挂一个源名 —— 满屏都是"腾讯"是噪音。只有主源没给全、
+# 由备源补上的那几行才值得标出来。
+chk("auto 时期望的是主源", W.expected_source("auto") == P.PROVIDERS[0].key,
+    W.expected_source("auto"))
+chk("auto / None / 空串都当 auto", W.expected_source(None) == W.expected_source("")
+    == W.expected_source("auto"))
+chk("手选谁时期望的就是谁", W.expected_source("sina") == "sina")
+chk("手选 auto 之外的都原样", W.expected_source("tencent") == "tencent")
+chk("期望的源 → 不标（返回空串）", W.source_note("tencent", "tencent") == "")
+chk("不是期望的源 → 标出名字", W.source_note("sina", "tencent") == "新浪",
+    W.source_note("sina", "tencent"))
+chk("反过来自选新浪时腾讯也要标", W.source_note("tencent", "sina") == "腾讯",
+    W.source_note("tencent", "sina"))
+chk("没有 provider 不标", W.source_note("", "tencent") == "")
+chk("没有期望源也不标", W.source_note("sina", "") == "")
+chk("认不出来的源名不标（宁可少说）", W.source_note("sina3", "tencent") == "")
+chk("标出来的都是源自己的 label",
+    all(W.source_note(p.key, "___") == p.label for p in P.PROVIDERS))
 
 print("== 老板键解析 ==")
 chk("Ctrl+Alt+H", W.parse_hotkey("Ctrl+Alt+H") == (W.MOD_CONTROL | W.MOD_ALT, ord("H")),

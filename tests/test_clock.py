@@ -167,6 +167,23 @@ chk("长假后退回节前最后一个交易日",
     MC.last_quote_mmdd([], at("2026-10-08 08:00")) == "09-30",
     MC.last_quote_mmdd([], at("2026-10-08 08:00")))
 
+print("== 休市表的覆盖年限 ==")
+# 表没维护到的那一年会静默退化成"只按星期几判断"：国庆那周照样每 3 秒刷一次
+# 行情。不崩，但没有提示 —— 所以要把"覆盖到哪一年"变成能被检查的事实。
+today = MC.market_now().date()
+chk("当年必须维护过", MC.calendar_is_maintained(today.year), today.year)
+chk("calendar_horizon 返回最新的年份",
+    MC.calendar_horizon() == max(MC.MARKET_CLOSED_BY_YEAR), MC.calendar_horizon())
+chk("没维护的年份要如实说没维护",
+    not MC.calendar_is_maintained(1999) and not MC.calendar_is_maintained(2099))
+# 交易所一般在 11~12 月公布次年安排。放宽到 12 月才开始要：11 月公告常常还没出，
+# 那时候就变红只会逼人去填一份还查不到的数据。进了 12 月还没补上，才是真该更新了
+# —— 这条会自己变红，不需要谁记得。
+if today.month >= 12:
+    chk("12 月起必须已经维护好明年（%d）" % (today.year + 1),
+        MC.calendar_is_maintained(today.year + 1),
+        "该去补 %d 年的休市日了" % (today.year + 1))
+
 print()
 print("%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

@@ -22,16 +22,23 @@ if not exist "%PYEXE%" (
   pause
   exit /b 1
 )
+rem Deps present? Not a version question -- just "can it import PySide6".
+rem If not, hand the whole job back to install.bat instead of inventing a
+rem second, weaker install path here (it used to try one single mirror and
+rem give up, so a mirror outage looked like "the program is broken").
 "%PYEXE%" -c "import PySide6" >nul 2>&1
 if errorlevel 1 (
-  echo PySide6 missing. Installing from requirements.txt ...
-  "%PYEXE%" -m pip install -r "%~dp0requirements.txt" -i https://mirrors.aliyun.com/pypi/simple/
-  if errorlevel 1 (
-    echo.
-    echo Install failed. Check your network, or run install.bat manually.
-    pause
-    exit /b 1
-  )
+  echo.
+  echo Dependencies missing. Running install.bat ...
+  call "%~dp0install.bat"
+)
+"%PYEXE%" -c "import PySide6" >nul 2>&1
+if errorlevel 1 (
+  echo.
+  echo FAILED: PySide6 is still missing after install.bat.
+  echo See the error above, or run install.bat yourself and read its output.
+  pause
+  exit /b 1
 )
 if not exist "%PYW%" set "PYW=%PYEXE%"
 start "" "%PYW%" "%~dp0widget.py"

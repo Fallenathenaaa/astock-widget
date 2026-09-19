@@ -73,6 +73,23 @@ def is_market_day(d):
     return d.isoformat() not in MARKET_CLOSED_BY_YEAR.get(d.year, set())
 
 
+def calendar_is_maintained(year):
+    """这一年的休市日表维护过了没有。
+
+    没维护到的年份会静默退化成"只按星期几判断" —— 于是国庆那周会照常每 3 秒
+    刷一次行情（接口当然没数据）。功能上不崩，但白耗资源，而且**没有任何提示**
+    告诉你"表过期了"。这个函数让"表有没有覆盖"变成一个能被检查的事实：
+    启动自检和 CI 都可以拿它问一句"明年还有没有"。
+    """
+    return year in MARKET_CLOSED_BY_YEAR
+
+
+def calendar_horizon(now=None):
+    """这份表覆盖到哪一年。没维护任何一年返回 None。"""
+    years = sorted(MARKET_CLOSED_BY_YEAR)
+    return years[-1] if years else None
+
+
 def market_phase(now=None):
     """返回当前时段（见上面的常量）。now 不带时区时按北京时间算。"""
     now = now or market_now()

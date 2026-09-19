@@ -13,6 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import providers as P  # noqa: E402
+import market_clock  # noqa: E402
 
 ok = fail = 0
 
@@ -27,10 +28,14 @@ def chk(n, c, x=""):
         print("  FAIL  %s   %s" % (n, x))
 
 
-def response(n):
+def response(n, volume="123456"):
     """造一条只有 n 个字段的腾讯响应。
 
-    字段位置照真实接口排（0=市场标识、1=名称、2=代码、3=现价、4=昨收…）。
+    字段位置照真实接口排（0=市场标识、1=名称、2=代码、3=现价、4=昨收…）；
+    长度够得着 f[36] 就填上成交量，模拟真实响应。想造"成交量这一列不存在"
+    的截断响应就传长度 36（`response(36)` 最后一个下标是 35）。
+
+    volume 传 "0" 可以造"明确给了 0"的场景 —— 和"没给"是两回事。
     """
     f = ["0"] * n
     f[0] = "1"
@@ -38,6 +43,11 @@ def response(n):
     f[2] = "600519"
     f[3] = "1257.12"        # 现价
     f[4] = "1266.98"        # 昨收
+    if n > 36:
+        f[36] = volume      # 成交量（手）
+    if n > 48:
+        # 涨跌停价：腾讯直接在响应里给，新浪不给（那边只能按板块推算）
+        f[47], f[48] = "1393.68", "1140.28"
     return ('v_sh600519="' + "~".join(f) + '";').encode("gbk", errors="ignore")
 
 
@@ -75,14 +85,60 @@ for n in (30, 34, 35, 36, 37, 40, 47, 48, 49, 50):
 print("== 缺的字段按缺省处理，不是崩 ==")
 P.http_get = FakeGet(response(36))
 q = P.TencentProvider().quotes(["sh600519"])[0]
-chk("成交量取不到 → 0（不是 IndexError）", q["volume"] == 0.0, q["volume"])
+chk("成交量取不到 → None（不是 IndexError，也不是 0）", q["volume"] is None, q["volume"])
 chk("涨跌停取不到 → 按板块推算", q["limit_up"] > 0 and q["limit_dn"] > 0,
     (q["limit_up"], q["limit_dn"]))
 chk("涨跌幅照样算得出来", abs(q["pct"] + 0.78) < 0.01, q["pct"])
 
 P.http_get = FakeGet(response(50))
 q = P.TencentProvider().quotes(["sh600519"])[0]
-chk("长度够了成交量还是 0（我们没填）", q["volume"] == 0.0, q["volume"])
+chk("长度够了成交量照常解析", q["volume"] == 123456.0, q["volume"])
+
+print("== 成交量「没给」≠「给了 0」==")
+# 盘中（已开盘）才需要区分这两者：盘前成交量本来就是 0 且不判停牌
+_real_started = market_clock.has_session_started
+market_clock.has_session_started = lambda *a, **k: True
+
+P.http_get = FakeGet(response(36))       # 根本没有成交量这一列
+q = P.TencentProvider().quotes(["sh600519"])[0]
+chk("缺成交量 → 不判停牌（价格照常显示）", q["status"] != P.HALT, q["status"])
+chk("缺成交量 → 状态是正常", q["status"] == P.NORMAL, q["status"])
+
+P.http_get = FakeGet(response(50, volume="0"))   # 明确给了 0
+q = P.TencentProvider().quotes(["sh600519"])[0]
+chk("成交量明确为 0 → 判停牌", q["status"] == P.HALT, q["status"])
+
+P.http_get = FakeGet(response(50, volume="888"))
+q = P.TencentProvider().quotes(["sh600519"])[0]
+chk("成交量 > 0 → 正常", q["status"] == P.NORMAL, q["status"])
+market_clock.has_session_started = _real_started
+
+print("== 新浪缺成交量同样不判停牌 ==")
+market_clock.has_session_started = lambda *a, **k: True
+# 成交量那一列留空 = 接口没给；下面 _sina_full 是同一个响应但成交量有值
+_sina_head = ('hq_str_sh600519="贵州茅台,1257.120,1266.980,1257.120,'
+              '1260.000,1250.000,1257.120,1257.120,')
+_sina_tail = (',0.000,0.000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,'
+              '2026-09-18,15:00:00,00";')
+_sina_line = _sina_head + "" + _sina_tail          # 成交量列为空
+_sina_full = _sina_head + "12345600" + _sina_tail  # 成交量有值（股）
+P.http_get = FakeGet(_sina_line.encode("gbk", errors="ignore"))
+out = P.SinaProvider().quotes(["sh600519"])
+chk("新浪成交量列为空 → volume 是 None", len(out) == 1 and out[0]["volume"] is None,
+    out[0]["volume"] if out else out)
+chk("新浪成交量列为空 → 不判停牌", out and out[0]["status"] != P.HALT,
+    out[0]["status"] if out else out)
+market_clock.has_session_started = _real_started
+
+print("== 每一条行情都带着自己的来源 ==")
+P.http_get = FakeGet(response(50))
+q = P.TencentProvider().quotes(["sh600519"])[0]
+chk("腾讯给的数据标着 tencent", q["provider"] == "tencent", q["provider"])
+chk("腾讯给了涨跌停价 → 不是推算", q["limit_estimated"] is False, q["limit_estimated"])
+P.http_get = FakeGet(_sina_full.encode("gbk", errors="ignore"))
+q = P.SinaProvider().quotes(["sh600519"])[0]
+chk("新浪给的数据标着 sina", q["provider"] == "sina", q["provider"])
+chk("新浪没给涨跌停价 → 标成推算", q["limit_estimated"] is True, q["limit_estimated"])
 
 print("== 乱码 / 空响应 ==")
 for name, payload in [("空", b""), ("只有分号", b";"),

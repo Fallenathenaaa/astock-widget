@@ -93,6 +93,31 @@ try:
 except Exception as e:
     chk("带持仓能渲染", False, repr(e))
 
+print("== 备源补上的那行也能画（会挂一个来源小字）==")
+w.cfg["data_source"] = "auto"
+w.rows = [
+    {"name": "贵州茅台", "code": "600519", "full": "sh600519",
+     "price": 1432.5, "change": 12.5, "pct": 0.88, "decimals": 2,
+     "provider": "tencent"},
+    {"name": "宁德时代", "code": "300750", "full": "sz300750",
+     "price": 182.4, "change": -1.58, "pct": -0.86, "decimals": 2,
+     "provider": "sina"},
+]
+try:
+    w.grab()
+    chk("混着两个源能渲染", True)
+except Exception as e:
+    chk("混着两个源能渲染", False, repr(e))
+# 手选新浪时，期望源变成新浪 —— 该标的那行变成腾讯那行，两条路都要能画
+w.cfg["data_source"] = "sina"
+try:
+    w.grab()
+    chk("手选源后也能渲染", True)
+except Exception as e:
+    chk("手选源后也能渲染", False, repr(e))
+w.cfg["data_source"] = "auto"
+w.rows = []
+
 print("== Konami 口令 ==")
 w._unlocked = False
 for k in W.KONAMI:
