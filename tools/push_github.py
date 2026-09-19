@@ -26,6 +26,7 @@
 import os
 import sys
 import base64
+import hashlib
 import json
 import time
 import urllib.request
@@ -123,6 +124,20 @@ def remote_head(token):
     return ref["object"]["sha"]
 
 
+def remote_tree(token, commit_sha):
+    """远端现在的文件 -> blob sha。用来算增删，也用来跳过没变的文件。"""
+    code, commit = http("GET", "/repos/%s/%s/git/commits/%s" % (OWNER, REPO, commit_sha),
+                        token=token)
+    if code != 200:
+        return {}
+    code, tree = http("GET", "/repos/%s/%s/git/trees/%s?recursive=1"
+                      % (OWNER, REPO, commit["tree"]["sha"]), token=token)
+    if code != 200:
+        return {}
+    return {t["path"]: t["sha"] for t in tree.get("tree", [])
+            if t["type"] == "blob"}
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     msg_path = args[0] if args else None
@@ -153,6 +168,17 @@ def main():
         sys.exit("git ls-files 是空的 —— 什么都没推，八成是目录不对")
     print("本地文件: %d 个" % len(files))
 
+    # 远端现在有什么：用来算增删，也用来只上传真正变了的 blob
+    remote = remote_tree(token, parent_sha)
+    added = [p for p in files if p not in remote]
+    gone = [p for p in remote if p not in files]
+    print("相比远端：新增 %d，删除 %d（本地 git ls-files 为准）"
+          % (len(added), len(gone)))
+    for p in gone[:20]:
+        print("  - %s" % p)
+    if len(gone) > 20:
+        print("  ... 还有 %d 个" % (len(gone) - 20))
+
     blobs = {}
     t0 = time.time()
     for i, path in enumerate(files, 1):
@@ -162,6 +188,12 @@ def main():
                 data = f.read()
         except Exception as e:
             sys.exit("读 %s 失败：%s" % (path, e))
+        # blob sha 就是 git 的对象 id，本地算得出，没变就不用再传一次
+        blob_sha = hashlib.sha1(b"blob " + str(len(data)).encode()
+                                + b"\0" + data).hexdigest()
+        if remote.get(path) == blob_sha:
+            blobs[path] = blob_sha
+            continue
         if DRY_RUN:
             blobs[path] = ""
             continue
@@ -173,6 +205,9 @@ def main():
         blobs[path] = r["sha"]
         if i % 10 == 0 or i == len(files):
             print("  blobs: %d/%d  (%.1fs)" % (i, len(files), time.time() - t0))
+    print("  实际上传 %d 个，其余 %d 个与远端一致，跳过"
+          % (sum(1 for p in files if remote.get(p) != blobs[p]),
+             sum(1 for p in files if remote.get(p) == blobs[p])))
 
     if DRY_RUN:
         print("tree:    (dry-run，跳过建树)")
@@ -182,10 +217,13 @@ def main():
         print("dry-run 结束，远端未被修改。")
         return
 
+    # 不给 base_tree：树完全由本地文件构成，远端多出来的文件会真的消失。
+    # 以前带 base_tree，等于只能新增和覆盖 —— 本地删掉/改名的文件在远端
+    # 一直阴魂不散（screenshots/ 下那批就是这么留下来的）。
     tree_entries = [{"path": p, "mode": "100644", "type": "blob", "sha": blobs[p]}
                     for p in files]
     code, tree = http("POST", "/repos/%s/%s/git/trees" % (OWNER, REPO),
-                      {"base_tree": parent_sha, "tree": tree_entries}, token)
+                      {"tree": tree_entries}, token)
     if code != 201:
         sys.exit("建树失败：%s %s" % (code, tree))
     tree_sha = tree["sha"]
