@@ -159,17 +159,72 @@ for i in range(5):
 chk("反复写后只剩一个配置文件",
     sorted(os.listdir(tmp)) == ["stocks.json"], os.listdir(tmp))
 
-print("== worker 停机等待 > HTTP 超时 ==")
-# HTTP 超时 5 秒；等的时间比它短，就是在线程还在收数据的时候硬杀
+print("== 布尔值：字符串也要按字面意思算 ==")
+# 以前是 bool(v)：非空字符串全是 True，于是配置里写 "false" 反而变成 True ——
+# 用户在菜单里关掉的开关，重启后又自己开了。
+chk('"false" → False', W.validate_config({"click_through": "false"})["click_through"] is False)
+chk('"true" → True', W.validate_config({"click_through": "true"})["click_through"] is True)
+chk('"FALSE" 大小写都认', W.validate_config({"spark": "FALSE"})["spark"] is False)
+chk('" true " 带空格也认', W.validate_config({"spark": " true "})["spark"] is True)
+chk("0 → False", W.validate_config({"locked": 0})["locked"] is False)
+chk("1 → True", W.validate_config({"locked": 1})["locked"] is True)
+chk('"0" → False', W.validate_config({"locked": "0"})["locked"] is False)
+chk("认不出来的退回默认", W.validate_config({"click_through": "maybe"})["click_through"]
+    == W.DEFAULT_CONFIG["click_through"])
+chk("2 不是合法布尔，退回默认", W.validate_config({"spark": 2})["spark"]
+    == W.DEFAULT_CONFIG["spark"])
+chk("None 退回默认", W.validate_config({"spark": None})["spark"]
+    == W.DEFAULT_CONFIG["spark"])
+chk("真布尔原样", W.validate_config({"spark": False})["spark"] is False)
+
+print("== 持仓逐条校验 ==")
+chk("正常持仓保留",
+    W.validate_config({"positions": {"sh600519": {"cost": 1250.0, "shares": 100}}})
+    ["positions"] == {"sh600519": {"cost": 1250.0, "shares": 100.0}},
+    W.validate_config({"positions": {"sh600519": {"cost": 1250.0, "shares": 100}}})["positions"])
+# 这几种以前都能一路带到 UI，画盈亏时 pos.get(...) 直接崩
+for bad in ["oops", 123, None, []]:
+    out = W.validate_config({"positions": {"sh600519": bad}})["positions"]
+    chk("坏条目 %r 被丢掉" % (bad,), out == {}, out)
+for bad_cost in ["nan", "inf", "-inf", -10, 0, "abc", None, True]:
+    out = W.validate_config({"positions": {"sh600519": {"cost": bad_cost}}})["positions"]
+    chk("成本 %r 不收" % (bad_cost,), out == {}, out)
+for bad_shares in ["abc", -100, "nan", "inf"]:
+    out = W.validate_config(
+        {"positions": {"sh600519": {"cost": 10.0, "shares": bad_shares}}})["positions"]
+    chk("股数 %r 不当股数用" % (bad_shares,),
+        out == {"sh600519": {"cost": 10.0}}, out)
+chk("没填股数也能留着（只算百分比）",
+    W.validate_config({"positions": {"sh600519": {"cost": 10.0}}})["positions"]
+    == {"sh600519": {"cost": 10.0}})
+chk("代码不合法整条丢掉",
+    W.validate_config({"positions": {"hk00700": {"cost": 10.0}}})["positions"] == {})
+chk("坏的不连累好的",
+    W.validate_config({"positions": {"sh600519": {"cost": 10.0},
+                                     "sz000001": "oops"}})["positions"]
+    == {"sh600519": {"cost": 10.0}})
+chk("整个 positions 不是 dict → 空",
+    W.validate_config({"positions": "oops"})["positions"] == {})
+chk("代码会归一化成完整代码",
+    W.validate_config({"positions": {"600519": {"cost": 10.0}}})["positions"]
+    == {"sh600519": {"cost": 10.0}},
+    W.validate_config({"positions": {"600519": {"cost": 10.0}}})["positions"])
+
+print("== worker 停机等待能盖住一次完整降级 ==")
+# 单个源超时 5 秒；自动降级最坏要把两个源都试一遍。等的时间盖不住这个，
+# 就是在线程还在收数据的时候硬杀 —— Qt 会打 "Destroyed while thread is still running"。
 f = W.Fetcher()
 s = W.Searcher()
-chk("Fetcher 等待 ≥ 6 秒", f.WORKER_WAIT_MS >= 6000, f.WORKER_WAIT_MS)
-chk("Searcher 等待 ≥ 6 秒", s.WORKER_WAIT_MS >= 6000, s.WORKER_WAIT_MS)
-chk("HTTP 超时是 5 秒", P.http_get.__defaults__[0] == 5,
-    P.http_get.__defaults__)
-chk("等待时间 = 超时 + 余量",
-    f.WORKER_WAIT_MS >= P.http_get.__defaults__[0] * 1000,
-    (f.WORKER_WAIT_MS, P.http_get.__defaults__[0]))
+worst = P.HTTP_TIMEOUT * 1000 * len(P.PROVIDERS)
+chk("HTTP 超时是 5 秒", P.HTTP_TIMEOUT == 5, P.HTTP_TIMEOUT)
+chk("不止一个源（所以真会降级）", len(P.PROVIDERS) > 1, len(P.PROVIDERS))
+chk("Fetcher 等待 ≥ 两个源都超时", f.WORKER_WAIT_MS >= worst,
+    (f.WORKER_WAIT_MS, worst))
+chk("Searcher 等待 ≥ 两个源都超时", s.WORKER_WAIT_MS >= worst,
+    (s.WORKER_WAIT_MS, worst))
+chk("还留了解析/建连接的余量", f.WORKER_WAIT_MS - worst >= 1000,
+    f.WORKER_WAIT_MS - worst)
+chk("不再是旧的单源 6500", f.WORKER_WAIT_MS != 6500, f.WORKER_WAIT_MS)
 f._stop = True
 s._stop = True
 

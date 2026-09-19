@@ -74,11 +74,59 @@ chk("10:00 已开盘", MC.has_session_started(at("2026-09-18 10:00")))
 chk("周末按已开盘算", MC.has_session_started(at("2026-09-19 10:00")))
 
 print("== 2026 官方休市日 ==")
-for day in ("2026-01-01", "2026-02-23", "2026-05-04", "2026-05-05",
-            "2026-09-25", "2026-10-01", "2026-10-02",
-            "2026-10-05", "2026-10-06", "2026-10-07"):
-    d = datetime.strptime(day, "%Y-%m-%d").date()
-    chk("%s 休市" % day, not MC.is_market_day(d))
+# 独立 fixture：照抄上交所《关于 2026 年部分节假日休市安排的通知》
+# （上证公告〔2025〕45 号）里的假期起止，再自己换算成工作日休市日。
+# 和 market_clock 里那份表**分开维护** —— 两边不一致就是有一边错了。
+OFFICIAL_HOLIDAYS_2026 = {
+    # 假期起止（含周末）-> 里面属于工作日的那些天
+    "元旦":   (("2026-01-01", "2026-01-03"),
+               ("2026-01-01", "2026-01-02")),
+    "春节":   (("2026-02-15", "2026-02-23"),
+               ("2026-02-16", "2026-02-17", "2026-02-18",
+                "2026-02-19", "2026-02-20", "2026-02-23")),
+    "清明":   (("2026-04-04", "2026-04-06"),
+               ("2026-04-06",)),
+    "劳动节": (("2026-05-01", "2026-05-05"),
+               ("2026-05-01", "2026-05-04", "2026-05-05")),
+    "端午":   (("2026-06-19", "2026-06-21"),
+               ("2026-06-19",)),
+    "中秋":   (("2026-09-25", "2026-09-27"),
+               ("2026-09-25",)),
+    "国庆":   (("2026-10-01", "2026-10-07"),
+               ("2026-10-01", "2026-10-02", "2026-10-05",
+                "2026-10-06", "2026-10-07")),
+}
+
+official_closed = set()
+for name, (span, workdays) in OFFICIAL_HOLIDAYS_2026.items():
+    for day in workdays:
+        official_closed.add(day)
+
+for name, (span, workdays) in OFFICIAL_HOLIDAYS_2026.items():
+    for day in workdays:
+        d = datetime.strptime(day, "%Y-%m-%d").date()
+        chk("%s %s 休市" % (name, day), not MC.is_market_day(d))
+        # 假期里的每一天（含周末）都不能被判成开市
+    lo = datetime.strptime(span[0], "%Y-%m-%d").date()
+    hi = datetime.strptime(span[1], "%Y-%m-%d").date()
+    cur = lo
+    while cur <= hi:
+        chk("%s 假期内 %s 不开市" % (name, cur.isoformat()),
+            not MC.is_market_day(cur))
+        cur += timedelta(days=1)
+
+# 反向：2026 全年每个工作日，只要被判成休市，就必须在官方清单里
+# —— 防止表里多塞了日期（漏了上面的用例会抓到，多了只有这条能抓到）
+extra = []
+d = datetime(2026, 1, 1).date()
+while d.year == 2026:
+    if d.weekday() < 5 and not MC.is_market_day(d):
+        if d.isoformat() not in official_closed:
+            extra.append(d.isoformat())
+    d += timedelta(days=1)
+chk("没有官方清单之外的休市日（不多塞）", not extra, "、".join(extra[:8]))
+chk("全年工作日休市日共 %d 天" % len(official_closed),
+    len(official_closed) == 19, str(len(official_closed)))
 # 节假日里的任何一个时刻都不能被判成交易中
 chk("国庆当天 10:00 不算交易中",
     not MC.is_trading_now(at("2026-10-01 10:00")))

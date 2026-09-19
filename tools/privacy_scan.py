@@ -69,9 +69,23 @@ def tracked_files():
 
 
 def commit_messages():
+    """全部 commit message。
+
+    CI 上如果 checkout 没带 `fetch-depth: 0`，这里只能拿到 1 条 —— 那"扫描全部
+    commit message"就是句空话。所以 main() 里会顺带报个数，只有 1 条直接失败。
+    """
     r = subprocess.run(["git", "log", "--format=%H%x09%s%x09%b"], cwd=ROOT,
                        capture_output=True, encoding="utf-8", errors="replace")
     return r.stdout or ""
+
+
+def commit_count():
+    r = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=ROOT,
+                       capture_output=True, encoding="utf-8", errors="replace")
+    try:
+        return int((r.stdout or "0").strip())
+    except ValueError:
+        return 0
 
 
 def scan():
@@ -118,7 +132,13 @@ def scan():
 
 def main():
     files, hits = scan()
-    print("扫描 %d 个已入库文件 + 全部 commit message" % len(files))
+    n = commit_count()
+    print("扫描 %d 个已入库文件 + %d 条 commit message" % (len(files), n))
+    if n <= 1:
+        # 浅克隆（CI 的 checkout 没带 fetch-depth: 0）会走到这里
+        print("!! 只看到 %d 条 commit —— 大概率是浅克隆，"
+              "「全部 commit message」不成立。给 checkout 加 fetch-depth: 0" % n)
+        return 1
     if hits:
         print("命中 %d 处：" % len(hits))
         for kind, where, what in hits:

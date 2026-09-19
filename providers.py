@@ -28,7 +28,10 @@ LIMIT_DN = "limit_dn"       # 跌停
 STATUS_TEXT = {HALT: "停牌", LIMIT_UP: "涨停", LIMIT_DN: "跌停"}
 
 
-def http_get(url, timeout=5, headers=None):
+HTTP_TIMEOUT = 5      # 单个源的请求超时（秒）
+
+
+def http_get(url, timeout=HTTP_TIMEOUT, headers=None):
     h = dict(UA)
     if headers:
         h.update(headers)
@@ -179,7 +182,9 @@ class TencentProvider(Provider):
                 continue
             q = make_quote(full, f[2], f[1], f[3], f[4],
                            high=f[33], low=f[34], open_=f[5],
-                           volume=f[36], stamp=f[30],
+                           # f[36] 用 _field：接口偶尔给截断的响应，len(f) 正好
+                           # 35 或 36 时直接取 f[36] 会 IndexError，把整只丢掉
+                           volume=_field(f, 36), stamp=f[30],
                            limit_up=_num(_field(f, 47)),
                            limit_dn=_num(_field(f, 48)))
             if q:
@@ -364,44 +369,78 @@ class ProviderChain:
         return ([p for p in self.providers if p.key == key]
                 + [p for p in self.providers if p.key != key])
 
-    def call(self, method, *args, prefer="auto"):
-        """按优先级调用某个方法，返回第一个非空结果。
+    def call(self, method, *args, prefer="auto", want=None):
+        """按优先级调用某个方法。
+
+        want 给了一串 full code 时做**部分补缺**：主源只回来一半，就把缺的那几只
+        单独拿去问下一个源，最后按 want 的顺序合并 —— 主源漏掉的那只不会从界面上
+        凭空消失。不给 want 就是老行为：谁先给非空结果就用谁的（搜索、分时没有
+        "缺一部分"的概念，补缺没意义）。
 
         单个源挂了不算大事（换下一个），全挂了才把最后一个异常抛出去。
         """
         err = None
+        if want is None:
+            for p in self.order(prefer):
+                try:
+                    out = getattr(p, method)(*args)
+                except Exception as e:
+                    err = e
+                    continue
+                if out:
+                    self.last_ok = p.key
+                    return out
+            if err is not None:
+                raise err
+            return None
+
+        want_set = set(want)
+        got = {}
         for p in self.order(prefer):
+            missing = [c for c in want if c not in got]
+            if not missing:
+                break
             try:
-                out = getattr(p, method)(*args)
+                out = getattr(p, method)(missing, *args[1:])
             except Exception as e:
                 err = e
                 continue
-            if out:
+            for item in out or []:
+                k = item.get("full")
+                if k in want_set and k not in got:
+                    got[k] = item
+            if got:
                 self.last_ok = p.key
-                return out
-        if err is not None:
+        if not got and err is not None:
             raise err
-        return None
+        return [got[c] for c in want if c in got]
 
 
-_CHAIN = ProviderChain(PROVIDERS)
+# 三个入口各用一条链：搜索降级到新浪不该改变下一轮**行情**的源的优先级 ——
+# 以前三者共用一个 last_ok，一次搜索失败就能把行情主源带偏。
+_QUOTE_CHAIN = ProviderChain(PROVIDERS)
+_SEARCH_CHAIN = ProviderChain(PROVIDERS)
+_SPARK_CHAIN = ProviderChain(PROVIDERS)
 
 
 def fetch_quotes(codes, prefer="auto"):
-    """抓行情。全部源都失败时抛最后一个异常。"""
-    return _CHAIN.call("quotes", codes, prefer=prefer) or []
+    """抓行情。要哪几只就尽量给全：主源漏了的会拿备源补。
+
+    全部源都失败时抛最后一个异常。
+    """
+    return _QUOTE_CHAIN.call("quotes", codes, prefer=prefer, want=codes) or []
 
 
 def search_stocks(keyword, limit=8, prefer="auto"):
     """搜股票。没结果返回 []（不算失败，不会因此去试下一个源）。"""
-    return _CHAIN.call("search", keyword, limit, prefer=prefer) or []
+    return _SEARCH_CHAIN.call("search", keyword, limit, prefer=prefer) or []
 
 
 def fetch_spark(code, prefer="auto"):
     """分时走势。拿不到返回 None（两个源都可能没有分时数据）。"""
-    return _CHAIN.call("spark", code, prefer=prefer)
+    return _SPARK_CHAIN.call("spark", code, prefer=prefer)
 
 
 def current_source():
-    """上次实际用的是哪个源（"tencent" / "sina"），还没成功过就返回 None。"""
-    return _CHAIN.last_ok
+    """行情上次实际用的是哪个源（"tencent" / "sina"），还没成功过返回 None。"""
+    return _QUOTE_CHAIN.last_ok

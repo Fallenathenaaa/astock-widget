@@ -254,10 +254,9 @@ def main():
         sys.exit("更新 %s 失败：%s %s" % (BRANCH, code, r))
     print("%s -> %s OK" % (BRANCH, commit_sha[:8]))
     print("https://github.com/%s/%s/commit/%s" % (OWNER, REPO, commit_sha))
-    # 版本号没变、只是把同一版的内容换成最新代码时，tag 还指着旧 commit，
-    # 得挪一下。别手搓 API 调用 —— 删掉已发布的 tag 会让 Release 变草稿。
-    print("\n版本号没变但要更新 Release 内容的话："
-          "python tools/move_tag.py --sha %s" % commit_sha)
+    # 内容要更新就发新版本号，别去挪已经发出去的 tag —— 旧链接指向的代码会变，
+    # Release 还会变成草稿（网址变成 untagged-xxxxx）。
+    print("\n要发新版：改 widget.py 里的 APP_VERSION，然后 python tools/release_tag.py")
 
 
 if __name__ == "__main__":

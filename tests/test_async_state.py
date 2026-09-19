@@ -271,6 +271,26 @@ try:
     market_clock.market_phase = lambda now=None: market_clock.CLOSED
     w.check_close_effect([row("sh600519", "600519", "贵州茅台", pct=5.0)])
     chk("15:00 之后不触发", w.effects == {}, w.effects)
+
+    # 逐行看日期：以前是"有一行是今天"就全体放行，于是 A 涨 5% 触发之后，
+    # 挂着昨天收盘价的 B 也能拿昨天的 +8% 跟着一起烧。
+    market_clock.market_phase = lambda now=None: market_clock.CLOSING_CALL
+    w.effects.clear()
+    w._effect_date = ""
+    today_row = row("sh600519", "600519", "贵州茅台", pct=5.0)
+    old_row = row("sz000001", "000001", "平安银行", pct=8.0)
+    old_row["time"] = "20260917150000"      # 昨天
+    w.check_close_effect([today_row, old_row])
+    chk("只烧今天的，昨天的那只不跟着",
+        set(w.effects) == {"sh600519"}, set(w.effects))
+    chk("今天的确实是 fire", w.effects.get("sh600519", {}).get("type") == "fire")
+    chk("昨天的没被记上", "sz000001" not in w.effects, set(w.effects))
+
+    # 全都是昨天的 → 一行都不触发（哪怕涨幅更大）
+    w.effects.clear()
+    w._effect_date = ""
+    w.check_close_effect([old_row])
+    chk("全是昨天的就一行都不触发", w.effects == {}, w.effects)
 finally:
     market_clock.market_phase = _real
     market_clock.market_now = _real_now
@@ -289,6 +309,20 @@ try:
         set(w.flash) == {"sh000001", "sz000001"}, set(w.flash))
 finally:
     market_clock.market_phase = _real_phase
+
+print("== 换数据源后，旧源的在途行情要被丢掉 ==")
+w.apply_watchlist(["sh600519"])
+gen_a = w.watchlist_generation
+w.set_data_source("sina")
+gen_b = w.watchlist_generation
+chk("切源 → generation +1", gen_b == gen_a + 1, (gen_a, gen_b))
+# 旧源（腾讯）的请求是在切源之前发出去的，现在才回来
+w.rows = []
+emit([row("sh600519", "600519", "贵州茅台", 9.9)], gen=gen_a)
+chk("旧源的行情不进界面", w.rows == [], w.rows)
+emit([row("sh600519", "600519", "贵州茅台", 1.1)], gen=gen_b)
+chk("新源的行情照常收下", len(w.rows) == 1, w.rows)
+w.set_data_source("auto")
 
 print()
 print("%d passed, %d failed" % (ok, fail))

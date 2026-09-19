@@ -4,6 +4,7 @@
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -54,7 +55,10 @@ def key(k):
 
 
 print("== 版本号 ==")
-chk("APP_VERSION = v2.1.0", W.APP_VERSION == "v2.1.0", W.APP_VERSION)
+# 别把版本号写死在测试里 —— 每发一版就得改一次，忘了就红。
+# 这里只管格式（vX.Y.Z），具体是哪个版本由 widget.py 说了算。
+chk("APP_VERSION 形如 vX.Y.Z：%s" % W.APP_VERSION,
+    bool(re.fullmatch(r"v\d+\.\d+\.\d+", W.APP_VERSION or "")), W.APP_VERSION)
 
 print("== 渲染冒烟 ==")
 w.rows = [

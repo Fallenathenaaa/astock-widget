@@ -115,6 +115,100 @@ try:
 except IOError:
     chk("全挂了要抛异常", True)
 
+print("== 三个入口各自记源，不互相串 ==")
+
+
+class TQuotesOk(P.Provider):
+    """行情正常，但搜索挂了。"""
+    key = "t"
+
+    def quotes(self, codes):
+        return [{"full": c} for c in codes]
+
+    def search(self, keyword, limit=8):
+        raise IOError("search down")
+
+
+class SSearchOk(P.Provider):
+    """行情挂了，但搜索正常。"""
+    key = "s"
+
+    def quotes(self, codes):
+        raise IOError("quotes down")
+
+    def search(self, keyword, limit=8):
+        return [{"full": "sh600519"}]
+
+
+_old_chains = (P._QUOTE_CHAIN, P._SEARCH_CHAIN)
+try:
+    P._QUOTE_CHAIN = P.ProviderChain([TQuotesOk(), SSearchOk()])
+    P._SEARCH_CHAIN = P.ProviderChain([TQuotesOk(), SSearchOk()])
+    P.fetch_quotes(["sh600519"])
+    chk("行情用主源", P.current_source() == "t", P.current_source())
+    P.search_stocks("mt")
+    chk("搜索降级到备源不改动行情的源",
+        P.current_source() == "t", P.current_source())
+    chk("搜索链的源是备源",
+        P._SEARCH_CHAIN.last_ok == "s", P._SEARCH_CHAIN.last_ok)
+finally:
+    P._QUOTE_CHAIN, P._SEARCH_CHAIN = _old_chains
+
+print("== 主源部分返回时备源补缺 ==")
+
+
+class Half(P.Provider):
+    """故意漏掉中间那只。"""
+    key = "half"
+
+    def __init__(self):
+        self.asked = []
+
+    def quotes(self, codes):
+        self.asked.append(list(codes))
+        return [{"full": c} for c in codes if c != "sh000002"]
+
+
+class Rest(P.Provider):
+    """备源：只回答问到的那些。"""
+    key = "rest"
+
+    def __init__(self):
+        self.asked = []
+
+    def quotes(self, codes):
+        self.asked.append(list(codes))
+        return [{"full": c} for c in codes]
+
+
+half, rest = Half(), Rest()
+chain3 = P.ProviderChain([half, rest])
+want = ["sh000001", "sh000002", "sh000003"]
+out = chain3.call("quotes", want, want=want)
+chk("三只全回来了", [o["full"] for o in out] == want, [o["full"] for o in out])
+chk("按请求顺序返回", [o["full"] for o in out] == want)
+chk("主源被问的是全部", half.asked == [want], half.asked)
+chk("备源只被问缺的那一只", rest.asked == [["sh000002"]], rest.asked)
+chk("补到了就算备源成功过", chain3.last_ok == "rest", chain3.last_ok)
+
+# 主源全给了，备源就不该被吵醒
+half2, rest2 = Half(), Rest()
+chain4 = P.ProviderChain([half2, rest2])
+chain4.call("quotes", ["sh000001"], want=["sh000001"])
+chk("没缺的就不去问备源", rest2.asked == [], rest2.asked)
+
+# 备源也补不到 → 缺的那只就是没有，其余照常返回
+class Empty(P.Provider):
+    key = "empty"
+
+    def quotes(self, codes):
+        return []
+
+
+out = P.ProviderChain([Half(), Empty()]).call("quotes", want, want=want)
+chk("补不到也不影响已有的两只",
+    [o["full"] for o in out] == ["sh000001", "sh000003"], out)
+
 print("== 老板键解析 ==")
 chk("Ctrl+Alt+H", W.parse_hotkey("Ctrl+Alt+H") == (W.MOD_CONTROL | W.MOD_ALT, ord("H")),
     W.parse_hotkey("Ctrl+Alt+H"))

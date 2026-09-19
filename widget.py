@@ -45,7 +45,7 @@ import providers
 from providers import HALT, LIMIT_UP, LIMIT_DN
 
 APP_NAME = "A股桌面盯盘挂件"
-APP_VERSION = "v2.1.0"
+APP_VERSION = "v2.1.1"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "stocks.json")
@@ -208,8 +208,13 @@ def _nth_weekday(year, month, weekday, n):
 
 
 def _is_trading_day(d):
-    """只按周一~周五算交易日。调休/临时休市没法预知，不猜。"""
-    return d.weekday() < 5
+    """交易日统一走 market_clock 那份官方日历。
+
+    这里再单独写一个"只按周一~周五"，就变成双重日历了：行情状态知道法定休市，
+    日期触发只知道周末 —— 国庆那周两边会算出不一样的结果。
+    没维护到的年份 market_clock 会退回只按 weekday 判断，行为跟以前一致。
+    """
+    return market_clock.is_market_day(d)
 
 
 def _last_trading_day_before(d):
@@ -568,7 +573,29 @@ DOT_TAP_WINDOW = 2.0
 DOT_TAP_N = 5
 
 INDEX_CODES = ["sh000001", "sz399001", "sz399006"]   # 上证 / 深证 / 创业板
-INDEX_NAMES_LIST = ["上证", "深证", "创业板"]   # 按 INDEX_CODES 顺序；注意 sh000001 与 sz000001 返回的 code 都是 000001，只能按位置区分
+# 名字跟 full code 绑死，不跟返回顺序绑：sh000001（上证指数）和 sz000001
+# （平安银行）的 6 位代码都是 000001，只按位置取名的话，接口漏返回一只或者
+# 顺序变了，"深证 +1.2%" 就会挂在"上证"那一格上。
+INDEX_META = {"sh000001": "上证", "sz399001": "深证", "sz399006": "创业板"}
+
+
+def index_slots(indices):
+    """指数行 -> 固定 slot 上的 [(名称, 涨跌幅)]。
+
+    按 full code 归位，不按返回顺序。没返回的那一格 pct 是 None（画成 `--`），
+    后面的不会顶上来 —— 宁可空一格，也不能串位。
+    """
+    by_code = {}
+    for r in indices or []:
+        full = r.get("full")
+        if full and full not in by_code:
+            by_code[full] = r
+    out = []
+    for code in INDEX_CODES:
+        r = by_code.get(code)
+        out.append((INDEX_META.get(code, code),
+                    None if r is None else r.get("pct")))
+    return out
 
 DEFAULT_BOSS_KEY = "Ctrl+Alt+H"     # 老板键默认值（一键隐藏/恢复）
 BOSS_KEY_PRESETS = ["", DEFAULT_BOSS_KEY, "Ctrl+Alt+`",
@@ -606,6 +633,79 @@ CONFIG_CHOICES = {
 
 
 # ---------------- 工具 ----------------
+def _to_bool(v, default):
+    """严格转布尔：只认 True/False、0/1、"true"/"false"（大小写、空格都行）。
+
+    以前这里写的是 `bool(v)`，于是 JSON 里写 `"click_through": "false"` 会得到
+    True —— 非空字符串在 Python 里都是真。用户在菜单里关掉的开关，重启之后
+    又自己开了，反直觉到像闹鬼。
+
+    认不出来的（"yes"/"no" 之外的字符串、2、-1、None…）一律退回默认值，
+    不猜用户的意思。
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if v == 1:
+            return True
+        if v == 0:
+            return False
+        return default
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _finite_positive(v):
+    """转成有限正数。不是数字 / NaN / inf / 0 / 负数 → None。
+
+    bool 也不放过：`float(True)` 是 1.0，但没人会拿 True 当成本价，那是 JSON
+    写坏了，按坏的处理。
+    """
+    if isinstance(v, bool):
+        return None
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    if n != n or n in (float("inf"), float("-inf")):     # NaN / ±inf
+        return None
+    return n if n > 0 else None
+
+
+def sanitize_positions(raw):
+    """持仓逐条筛：代码合法、条目是 dict、成本是有限正数。
+
+    JSON 能解析不等于能用 —— `{"positions": {"sh600519": "oops"}}` 进了 UI，
+    画盈亏那行的 `pos.get("cost")` 直接 AttributeError；cost 是 NaN / inf /
+    负数会把盈亏算成一堆乱码。这里一条条过，**坏的那条丢掉，不是整个配置失效**。
+    """
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for code, item in raw.items():
+        if not isinstance(code, str) or not isinstance(item, dict):
+            continue
+        try:
+            full = normalize_code(code)
+        except Exception:
+            continue
+        if not full:
+            continue
+        cost = _finite_positive(item.get("cost"))
+        if cost is None:
+            continue                      # 没有成本价就没盈亏可算，整条丢掉
+        shares = _finite_positive(item.get("shares"))
+        out[full] = {"cost": cost}
+        if shares is not None:
+            out[full]["shares"] = shares
+    return out
+
+
 def validate_config(raw):
     """把读进来的配置按 DEFAULT_CONFIG 逐项校验。
 
@@ -624,7 +724,7 @@ def validate_config(raw):
         v = d[key]
         try:
             if isinstance(default, bool):
-                out[key] = bool(v)
+                out[key] = _to_bool(v, out[key])
             elif isinstance(default, (int, float)):
                 num = float(v)
                 if num != num:                       # NaN
@@ -637,9 +737,12 @@ def validate_config(raw):
                 out[key] = ([x for x in v if isinstance(x, str)][:5]
                             if isinstance(v, (list, tuple)) else list(default))
             elif isinstance(default, dict):
-                # 必须 deepcopy：直接把入参那个 dict 接过来，调用方后续改它
-                # 就会改到 DEFAULT_CONFIG 上，污染整个进程
-                out[key] = copy.deepcopy(v) if isinstance(v, dict) else {}
+                if key == "positions":
+                    out[key] = sanitize_positions(v)
+                else:
+                    # 必须 deepcopy：直接把入参那个 dict 接过来，调用方后续改它
+                    # 就会改到 DEFAULT_CONFIG 上，污染整个进程
+                    out[key] = copy.deepcopy(v) if isinstance(v, dict) else {}
             elif default is None:
                 out[key] = v                          # pos：值要么是 [x, y] 要么是 None，下面再验
         except (TypeError, ValueError):
@@ -1092,8 +1195,11 @@ class Fetcher(QThread):
     data_ready = Signal(dict)
     failed = Signal(str)
 
-    # HTTP 超时 5 秒，退出时至少等得起一次在途请求（见 WORKER_WAIT_MS）
-    WORKER_WAIT_MS = 6500
+    # 退出时要等得起"一次完整的在途调用"。单个源超时 5 秒，自动降级最坏要把
+    # 两个源都试一遍（5+5=10 秒）—— 6500 是只有一个源的时候定的，留不住了。
+    # 按源的数量算，以后再加第三个源也不会忘了改。
+    WORKER_WAIT_MS = (providers.HTTP_TIMEOUT * 1000 * len(providers.PROVIDERS)
+                      + 2000)      # 余量：解析 + 建连接的开销
 
     def __init__(self):
         super().__init__()
@@ -1125,6 +1231,33 @@ class Fetcher(QThread):
             self.spark_enabled = bool(on)
             self._spark_tick = 0    # 重新打开时立刻拉一次
 
+    def set_interval(self, fast):
+        """改刷新间隔（秒）。"""
+        with self._state_lock:
+            self.fast = int(fast or 3)
+
+    def set_show_index(self, on):
+        """要不要显示大盘指数条。"""
+        with self._state_lock:
+            self.show_index = bool(on)
+
+    def set_source(self, key):
+        """切数据源。
+
+        换源跟换自选股是一个性质：旧源的请求还在途，它回来之后 UI 不该再认。
+        所以 generation +1，让旧源的结果作废。
+        """
+        with self._state_lock:
+            self.source = key or "auto"
+            self._generation += 1
+            self._spark_tick = 0
+            return self._generation
+
+    def clear_spark_cache(self):
+        """换源后老的分时走势不该再留着（不同源画出来的形状不一样）。"""
+        with self._state_lock:
+            self._spark_cache.clear()
+
     def stop(self):
         self._stop = True
         self.wait(self.WORKER_WAIT_MS)
@@ -1149,6 +1282,10 @@ class Fetcher(QThread):
             rows = []
             if codes:
                 rows = self._fetch_rows(codes, source)
+            # 每做完一次网络调用就看一眼：这一轮最长能把两个源的超时都走完（10 秒），
+            # 退出时不该等它把指数、分时也一并拉完才返回。
+            if self._stop:
+                return
 
             # 指数和自选股分开请求：自选删空了，大盘照样要刷新
             idx = []
@@ -1234,7 +1371,9 @@ class Searcher(QThread):
     UI 靠 seq 丢弃先发的旧结果 —— 否则"输 mao 再改 pingan"最后会显示 mao。
     """
     result_ready = Signal(str, int, list)
-    WORKER_WAIT_MS = 6500
+    # 同上：最坏要把两个源都试一遍（5+5 秒），6500 已经盖不住了
+    WORKER_WAIT_MS = (providers.HTTP_TIMEOUT * 1000 * len(providers.PROVIDERS)
+                      + 2000)
 
     def __init__(self):
         super().__init__()
@@ -1246,6 +1385,15 @@ class Searcher(QThread):
     def submit(self, query, seq):
         with self._lock:
             self._pending = (query, seq)
+
+    def set_source(self, key):
+        """切数据源。锁里改 —— worker 线程同时在读它。
+
+        至于"旧源在途的搜索结果作废"，那是 UI 侧 search_seq 的事（set_data_source
+        里 +1），Searcher 只管别让 source 被乱写。
+        """
+        with self._lock:
+            self.source = key or "auto"
 
     def stop(self):
         self._stop = True
@@ -1344,7 +1492,8 @@ class Ticker(QWidget):
         self._dot_taps_at = 0.0
         self._unlocked = bool(cfg.get("unlocked"))   # 隐藏菜单是否已解锁（持久化）
         self._forced_festival = None   # 运行时强制开启的节日 key，不落盘
-        self.watchlist_generation = 0  # 当前自选股版本：旧版本的行情一律丢弃
+        # 当前行情版本：旧版本的行情一律丢弃。换自选股和换数据源都会 +1
+        self.watchlist_generation = 0
 
         # 全局按键监听：焦点在搜索框里也能收到方向键/字母
         _app = QApplication.instance()
@@ -1378,11 +1527,14 @@ class Ticker(QWidget):
             self.move_to_default()
 
         self.fetcher = Fetcher()
-        self.watchlist_generation = self.fetcher.set_codes(cfg.get("codes") or [])
-        self.fetcher.show_index = bool(cfg.get("show_index", True))
-        self.fetcher.fast = int(cfg.get("interval") or 3)
-        self.fetcher.source = cfg.get("data_source") or "auto"
+        # 一律走 setter：这些字段 worker 线程同时在读，直接赋值会绕过锁。
+        # 顺序有讲究：set_source 和 set_codes 都会让 generation +1，而 UI 只认
+        # set_codes 返回的那个 —— 所以 set_codes 必须放最后，否则两边差 1。
+        self.fetcher.set_show_index(bool(cfg.get("show_index", True)))
+        self.fetcher.set_interval(int(cfg.get("interval") or 3))
+        self.fetcher.set_source(cfg.get("data_source") or "auto")
         self.fetcher.set_spark_enabled(bool(cfg.get("spark", True)))
+        self.watchlist_generation = self.fetcher.set_codes(cfg.get("codes") or [])
         self.fetcher.data_ready.connect(self.on_data)
         self.fetcher.failed.connect(self.on_fail)
         self.fetcher.start()
@@ -1469,11 +1621,16 @@ class Ticker(QWidget):
     def set_data_source(self, key):
         self.cfg["data_source"] = key
         save_config(self.cfg)
-        self.fetcher.source = key
-        self.searcher.source = key
+        # 走 setter，别直接改属性：worker 线程同时在读这些字段。
+        # 返回的 generation 要同步给 UI —— 不然旧源在途的结果回来时，UI 那边的
+        # generation 没变，照样会收下。
+        self.watchlist_generation = self.fetcher.set_source(key)
+        self.searcher.set_source(key)
         # 换源了，老的分时走势不该再留着；set_spark_enabled 会顺手把 tick 归零
-        self.fetcher._spark_cache.clear()
+        self.fetcher.clear_spark_cache()
         self.fetcher.set_spark_enabled(bool(self.cfg.get("spark", True)))
+        # 旧源在途的搜索结果也要作废，不然切完源弹回来的还是上一个源的候选
+        self.search_seq += 1
 
     # ---- 窗口属性 ----
     def apply_flags(self):
@@ -1506,7 +1663,7 @@ class Ticker(QWidget):
         self.search_edit.show()
 
         self.searcher = Searcher()
-        self.searcher.source = self.cfg.get("data_source") or "auto"
+        self.searcher.set_source(self.cfg.get("data_source") or "auto")
         self.searcher.result_ready.connect(self.on_search_result)
         self.searcher.start()
 
@@ -1791,13 +1948,16 @@ class Ticker(QWidget):
         today = now.strftime("%Y-%m-%d")
         if self._effect_date == today:
             return
-        if not any((r.get("time") or "").startswith(now.strftime("%Y%m%d"))
-                   for r in rows):
+        # 逐行看日期，不是"有一行是今天"就全体放行：停牌那只可能还挂着昨天的
+        # 收盘价，A 涨 5% 触发之后，B 不该拿昨天的 +8% 跟着一起烧。
+        stamp = now.strftime("%Y%m%d")
+        valid = [r for r in rows if (r.get("time") or "").startswith(stamp)]
+        if not valid:
             return                      # 手里的还是昨天的数，等下一轮
         self._effect_date = today
         until = time.time() + EFFECT_SECONDS
         hit_fire, hit_frost = [], []
-        for r in rows:
+        for r in valid:
             full = r.get("full")
             if not full:
                 continue
@@ -2002,11 +2162,13 @@ class Ticker(QWidget):
             p.drawLine(14, y, w - 14, y)
         p.setFont(QFont("Microsoft YaHei", 7.5))
         slot = (w - 28) // 3
-        for i, r in enumerate(self.indices[:3]):
-            pct = r["pct"]
-            color = (self._up() if pct > 0
-                     else (self._down() if pct < 0 else self._flat()))
-            txt = "%s %+.2f%%" % (INDEX_NAMES_LIST[i] if i < len(INDEX_NAMES_LIST) else r["code"], pct)
+        for i, (name, pct) in enumerate(index_slots(self.indices)):
+            if pct is None:                     # 这一只没返回，留个空位别串
+                txt, color = "%s --" % name, self._flat()
+            else:
+                color = (self._up() if pct > 0
+                         else (self._down() if pct < 0 else self._flat()))
+                txt = "%s %+.2f%%" % (name, pct)
             if i == 0:
                 rect, align = QRect(14, y, slot, IDX_H), Qt.AlignVCenter | Qt.AlignLeft
             elif i == 1:
@@ -2884,7 +3046,7 @@ class Ticker(QWidget):
 
     def set_interval(self, v):
         self.cfg["interval"] = v
-        self.fetcher.fast = v
+        self.fetcher.set_interval(v)
         save_config(self.cfg)
         self.update()
 
@@ -2940,7 +3102,7 @@ class Ticker(QWidget):
 
     def toggle_index(self):
         self.cfg["show_index"] = not self.cfg.get("show_index", True)
-        self.fetcher.show_index = self.cfg["show_index"]
+        self.fetcher.set_show_index(self.cfg["show_index"])
         save_config(self.cfg)
         self.resize_to_rows()
         self.update()
