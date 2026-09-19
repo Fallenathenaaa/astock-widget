@@ -553,21 +553,21 @@ python tools/push_github.py      # 走 GitHub Git Data API 推送（绕开代理
 
 | 项目 | 数值 |
 |---|---|
-| `widget.py` 源文件 | **113.1 KB**（2883 行） |
-| ├ 有效代码行 | 2430 行 |
-| ├ 注释行 | 110 行（4%） |
-| └ 空行 | 343 行 |
-| 编译字节码 `.pyc` | 170.9 KB（运行缓存，删了会自动重建） |
+| `widget.py` 源文件 | **134.0 KB**（3356 行） |
+| ├ 有效代码行 | 2793 行 |
+| ├ 注释行 | 159 行（5%） |
+| └ 空行 | 404 行 |
+| 编译字节码 `.pyc` | 195.1 KB（运行缓存，删了会自动重建） |
 
 ### 目录
 
 | 目录 | 大小 | 文件数 | 运行要不要 |
 |---|---|---|---|
 | `tests/` | 98 KB | 22 | ❌ 开发用 |
-| `tools/` | 71 KB | 16 | ❌ 开发用 |
+| `tools/` | 84.9 KB | 18 | ❌ 开发用 |
 | `screenshots/` | 749 KB | 17 | ❌ 只给 README 配图 |
 
-**真正跑起来只需要 `widget.py` 135 KB + `stocks.json`（首次运行自动生成）。**
+**真正跑起来只需要 `widget.py` 134 KB + `stocks.json`（首次运行自动生成）。**
 
 第三方依赖只有 **PySide6** 一个（那是环境依赖，不算本项目体积）。
 
@@ -738,6 +738,9 @@ v2.0.0 为此做的降频：平时心跳 500 ms（2 fps）、有动画才 50 ms�
 | `tools/usage_sampler.py` | 长时间占用采样（CPU / RSS / 句柄 / GDI / USER / 线程 / 系统 CPU）→ csv + json |
 | `tools/report_usage.py` | 把采样 csv 整理成人能读的 markdown 报告 |
 | `tools/thread_probe.py` | 线程级 CPU：到底是哪几个线程在烧 CPU，有没有线程吃满一核 |
+| `tools/release_check.py` | 发版前检查：版本一致性 / 全量测试 / 静态自检 / 编译 / 必需文件 / 敏感内容 |
+| `tools/privacy_scan.py` | 三路扫描：**文件名 / 文件内容 / 全部 commit message**，查 token、本机路径、邮箱、手机号、私钥 |
+| `tools/move_tag.py` | 版本号不变时把 tag 挪到新 commit，并保住 Release 不掉草稿 |
 
 `selfcheck.py` 跑出来：未使用 import 0 个、没人引用的顶层名字 0 个、全部文件编译通过。
 （历史债记一笔：`Ticker` 类 1565 行偏大，暂时没拆 —— 拆它风险大于收益，测试覆盖到就行。）
