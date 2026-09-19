@@ -2,8 +2,8 @@
 cd /d "%~dp0"
 rem One-time dependency install (use this on a new machine)
 rem
-rem 依赖装在**本项目自己的 .venv 里**：不污染全局 Python，换台机器拷过去就能跑。
-rem 不要写死别人机器上不存在的绝对路径 —— 换台电脑必然找不到。
+rem Deps go into this project's own .venv: no pollution of the global
+rem Python, and the folder can be copied to another machine as is.
 
 set "VENV=%~dp0.venv"
 set "PYEXE=%VENV%\Scripts\python.exe"

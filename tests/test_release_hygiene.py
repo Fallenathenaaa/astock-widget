@@ -121,7 +121,9 @@ if os.path.exists(req):
     txt = read(req)
     chk("requirements.txt 里锁了 PySide6", "PySide6" in txt, txt[:80])
     chk("版本号是钉死的（不用浮动版本）",
-        re.search(r"PySide6\s*==\s*\d", txt) is not None, txt[:80])
+        # 包名允许带后缀：现在装的是 PySide6-Essentials（完整 PySide6 会
+        # 多拖一个 168 MB 的 Addons，一个模块都用不上）
+        re.search(r"PySide6[\w.-]*\s*==\s*\d", txt) is not None, txt[:80])
 
 import widget as W  # noqa: E402
 

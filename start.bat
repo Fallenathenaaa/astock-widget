@@ -2,20 +2,19 @@
 cd /d "%~dp0"
 rem A-Share desktop ticker launcher
 rem
-rem 只用本项目 .venv 里的解释器；没有就先跑 install.bat 装。
-rem 不再猜系统里哪个 python 装过 PySide6 —— 猜错了会启一个缺依赖的进程，
-rem 然后窗口不出现、报错也不显示（pythonw 没有控制台）。
-
+rem Use only the interpreter in this project's own .venv; run
+rem install.bat first if it is missing. Do not guess which system
+rem python has PySide6: a wrong guess starts a process with missing
+rem deps, and since pythonw has no console the window never appears
+rem and the error is never shown.
 set "VENV=%~dp0.venv"
 set "PYW=%VENV%\Scripts\pythonw.exe"
 set "PYEXE=%VENV%\Scripts\python.exe"
-
 if not exist "%PYEXE%" (
   echo.
   echo Not installed yet. Running install.bat first ...
   call "%~dp0install.bat"
 )
-
 if not exist "%PYEXE%" (
   echo.
   echo FAILED: %PYEXE% not found.
@@ -23,7 +22,6 @@ if not exist "%PYEXE%" (
   pause
   exit /b 1
 )
-
 "%PYEXE%" -c "import PySide6" >nul 2>&1
 if errorlevel 1 (
   echo PySide6 missing. Installing from requirements.txt ...
@@ -35,6 +33,5 @@ if errorlevel 1 (
     exit /b 1
   )
 )
-
 if not exist "%PYW%" set "PYW=%PYEXE%"
 start "" "%PYW%" "%~dp0widget.py"

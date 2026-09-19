@@ -4,6 +4,11 @@
 # 版本号钉死：PySide6 6.x 各小版本间有行为差异（托盘图标、高分屏缩放），
 # 浮动版本会让"在我机器上好好的"变成常态。
 #
+# 装 Essentials 而不是完整的 PySide6 元包：挂件只用了 QtCore / QtGui /
+# QtWidgets 三个模块，都在 Essentials 里。完整包会额外拖一个
+# PySide6_Addons（Qt3D / QtCharts / QtWebEngine / QtBluetooth …），
+# 168 MB，一个都用不上 —— 装它也只会白等二十分钟。
+#
 # 安装：
 #     python -m venv .venv
 #     .venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -14,4 +19,4 @@
 #
 # Python 版本：3.10 ~ 3.14（3.9 及以下没有 PySide6 6.11 的 wheel）
 
-PySide6==6.11.2
+PySide6-Essentials==6.11.2

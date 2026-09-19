@@ -273,7 +273,8 @@ cp stocks.example.json stocks.json
 ### 环境要求
 
 - Windows 10 / 11（Windows 11 上效果最佳）
-- Python 3.10 – 3.14（只依赖 PySide6==6.11.2）
+- Python 3.10 – 3.14（只依赖 `PySide6-Essentials==6.11.2`，约 77 MB）
+- 装的是 Essentials 而不是完整 `PySide6`：挂件只用 QtCore / QtGui / QtWidgets，完整包会多拖一个 168 MB 的 `PySide6_Addons`（Qt3D / QtCharts / QtWebEngine 等），一个都用不上
 
 ---
 

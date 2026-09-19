@@ -1,0 +1,7 @@
+# .bat 必须是 CRLF：cmd 遇到裸 LF 会解析错乱 —— 中文 rem 注释会和后面的
+# 命令粘成一坨，被当成可执行程序，报「'xxx' 不是内部或外部命令」。
+# Git 默认把文本文件按 LF 存库，所以这里显式钉死 checkout 时用 CRLF，
+# 免得 clone 下来的人拿到一份跑不起来的启动脚本。
+*.bat text eol=crlf
+
+*.sh text eol=lf
