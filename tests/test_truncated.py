@@ -28,7 +28,7 @@ def chk(n, c, x=""):
         print("  FAIL  %s   %s" % (n, x))
 
 
-def response(n, volume="123456"):
+def response(n, volume="123456", price="1257.12"):
     """造一条只有 n 个字段的腾讯响应。
 
     字段位置照真实接口排（0=市场标识、1=名称、2=代码、3=现价、4=昨收…）；
@@ -41,7 +41,7 @@ def response(n, volume="123456"):
     f[0] = "1"
     f[1] = "贵州茅台"
     f[2] = "600519"
-    f[3] = "1257.12"        # 现价
+    f[3] = price            # 现价
     f[4] = "1266.98"        # 昨收
     if n > 36:
         f[36] = volume      # 成交量（手）
@@ -122,11 +122,39 @@ _sina_tail = (',0.000,0.000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,'
               '2026-09-18,15:00:00,00";')
 _sina_line = _sina_head + "" + _sina_tail          # 成交量列为空
 _sina_full = _sina_head + "12345600" + _sina_tail  # 成交量有值（股）
+# 现价正好顶到「按板块推算出来的涨停价」：主板 10%，1266.98 * 1.1 = 1393.68
+_sina_at_limit = _sina_head.replace("1266.980,1257.120,", "1266.980,1393.680,") + \
+    "12345600" + _sina_tail
 P.http_get = FakeGet(_sina_line.encode("gbk", errors="ignore"))
 out = P.SinaProvider().quotes(["sh600519"])
 chk("新浪成交量列为空 → volume 是 None", len(out) == 1 and out[0]["volume"] is None,
     out[0]["volume"] if out else out)
 chk("新浪成交量列为空 → 不判停牌", out and out[0]["status"] != P.HALT,
+    out[0]["status"] if out else out)
+market_clock.has_session_started = _real_started
+
+print("== 畸形成交量也算「没给」，不是 0 ==")
+# 接口偶尔会塞占位符（"--" 真实见过）。那个字段读不出来，跟"成交量是 0"
+# 是两回事 —— 当 0 处理就会判成停牌，把一只正常交易的股票显示成 --。
+market_clock.has_session_started = lambda *a, **k: True
+for bad in ["abc", "--", "nan", "inf", "-inf", "1e999", "null", "N/A", "None"]:
+    P.http_get = FakeGet(response(50, volume=bad))
+    q = P.TencentProvider().quotes(["sh600519"])[0]
+    chk("成交量 %r → None（不是 0）" % bad, q["volume"] is None, q["volume"])
+    chk("成交量 %r → 不判停牌" % bad, q["status"] != P.HALT, q["status"])
+P.http_get = FakeGet(response(50, volume="0"))
+q = P.TencentProvider().quotes(["sh600519"])[0]
+chk("明确给了 0 才算 0", q["volume"] == 0.0, q["volume"])
+chk("明确给了 0 才判停牌", q["status"] == P.HALT, q["status"])
+P.http_get = FakeGet(response(50, volume="888"))
+q = P.TencentProvider().quotes(["sh600519"])[0]
+chk("正常成交量照常解析", q["volume"] == 888.0, q["volume"])
+# 新浪同理
+P.http_get = FakeGet((_sina_head + "abc" + _sina_tail).encode("gbk", errors="ignore"))
+out = P.SinaProvider().quotes(["sh600519"])
+chk("新浪畸形成交量 → None", out and out[0]["volume"] is None,
+    out[0]["volume"] if out else out)
+chk("新浪畸形成交量 → 不判停牌", out and out[0]["status"] != P.HALT,
     out[0]["status"] if out else out)
 market_clock.has_session_started = _real_started
 
@@ -139,6 +167,24 @@ P.http_get = FakeGet(_sina_full.encode("gbk", errors="ignore"))
 q = P.SinaProvider().quotes(["sh600519"])[0]
 chk("新浪给的数据标着 sina", q["provider"] == "sina", q["provider"])
 chk("新浪没给涨跌停价 → 标成推算", q["limit_estimated"] is True, q["limit_estimated"])
+
+print("== 推算的涨跌停价不产生权威徽标 ==")
+# 新浪不给涨跌停价，只能按板块算。那个值是近似规则，不能拿去当判据 ——
+# 否则用户看到的是一个看起来确定的「涨停」，实际是我们估的。
+P.http_get = FakeGet(_sina_at_limit.encode("gbk", errors="ignore"))
+q = P.SinaProvider().quotes(["sh600519"])[0]
+chk("新浪顶到推算涨停价 → 标成 estimated", q["limit_estimated"] is True)
+chk("新浪顶到推算涨停价 → 不判涨停", q["status"] != P.LIMIT_UP, q["status"])
+chk("新浪顶到推算涨停价 → 状态是正常", q["status"] == P.NORMAL, q["status"])
+# 腾讯直接给涨跌停价，那是接口数据，照常判
+P.http_get = FakeGet(response(50, price="1393.68"))
+q = P.TencentProvider().quotes(["sh600519"])[0]
+chk("腾讯顶到接口给的涨停价 → 不是 estimated", q["limit_estimated"] is False)
+chk("腾讯顶到接口给的涨停价 → 判涨停", q["status"] == P.LIMIT_UP, q["status"])
+# 跌停同理
+P.http_get = FakeGet(response(50, price="1140.28"))
+q = P.TencentProvider().quotes(["sh600519"])[0]
+chk("腾讯顶到接口给的跌停价 → 判跌停", q["status"] == P.LIMIT_DN, q["status"])
 
 print("== 乱码 / 空响应 ==")
 for name, payload in [("空", b""), ("只有分号", b";"),

@@ -45,7 +45,7 @@ import providers
 from providers import HALT, LIMIT_UP, LIMIT_DN
 
 APP_NAME = "A股桌面盯盘挂件"
-APP_VERSION = "v2.1.2"
+APP_VERSION = "v2.1.3"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "stocks.json")
@@ -606,7 +606,8 @@ DEFAULT_CONFIG = {
     "show_index": True,
     "ui_scale": 1.0,        # 整体缩放（字体/行高/间距一起变）
     "alert_pct": 3.0,       # 涨跌幅绝对值超过此值就提醒；0 = 关闭
-    "effect_pct": 3.0,      # 14:57 收盘彩蛋阈值：涨超=燃烧，跌超=结霜；0 = 关闭
+    "effect_pct": 3.0,      # 收盘彩蛋阈值：14:57–15:00 内第一次拿到当天行情时，
+                            # 涨超=燃烧，跌超=结霜；0 = 关闭
     "positions": {},        # 持仓：{"sh600519": {"cost": 1250.0, "shares": 100}}；shares 可省略
     "codes": ["sh600519", "sz000001", "sz300750"],
     "interval": 3,
@@ -684,20 +685,19 @@ def _finite_number(v):
 
 
 def _finite_positive(v):
-    """转成有限正数。不是数字 / NaN / inf / 0 / 负数 → None。
+    """转成有限正数。不是数字 / NaN / ±inf / 0 / 负数 → None。
 
     bool 也不放过：`float(True)` 是 1.0，但没人会拿 True 当成本价，那是 JSON
     写坏了，按坏的处理。
+
+    ★ 必须复用 `_finite_number`，不能自己再写一遍 `float(v)`：
+    自己写的那版只兜了 (TypeError, ValueError)，而 `float(10 ** 400)` 抛的是
+    **OverflowError**。JSON 里一个 400 位的整数就能让它炸出 sanitize_positions，
+    被 validate_config 外层兜住 —— 结果是**整份 positions 回退成空**，
+    连明明合法的那几条持仓一起丢，正好违背"坏一条只丢一条"。
     """
-    if isinstance(v, bool):
-        return None
-    try:
-        n = float(v)
-    except (TypeError, ValueError):
-        return None
-    if n != n or n in (float("inf"), float("-inf")):     # NaN / ±inf
-        return None
-    return n if n > 0 else None
+    n = _finite_number(v)
+    return n if n is not None and n > 0 else None
 
 
 def sanitize_positions(raw):
@@ -802,6 +802,11 @@ def validate_config(raw):
                     continue
                 out[key] = int(num) if isinstance(default, int) else num
             elif isinstance(default, str):
+                if v is None:
+                    # JSON 里的 null 就是"没写"。str(None) 会变成字面量 "None"，
+                    # 于是标题栏上写着 None —— 而 validator 的规矩是
+                    # 「脏输入退回默认」，null 也该走这条。
+                    continue
                 out[key] = _validated_str(key, v)
             elif isinstance(default, list):
                 # 只收字符串：str(x) 会把 None 变成字面量 "None"，那是纯垃圾
@@ -1344,6 +1349,7 @@ class Fetcher(QThread):
     # 按源的数量算，以后再加第三个源也不会忘了改。
     WORKER_WAIT_MS = (providers.HTTP_TIMEOUT * 1000 * len(providers.PROVIDERS)
                       + 2000)      # 余量：解析 + 建连接的开销
+    SPARK_TTL = 300     # 分时缓存的有效期（秒）
 
     def __init__(self):
         super().__init__()
@@ -1352,7 +1358,9 @@ class Fetcher(QThread):
         self._generation = 0
         self._stop = False
         self._fail_count = 0
-        self._spark_cache = {}      # full -> (ts, pts)
+        # full -> {"ts", "source", "generation", "pts"}
+        # 后两个是身份：换源或换自选之后，旧 entry 天然不该再被命中
+        self._spark_cache = {}
         self._spark_tick = 0
         # 这些也会在锁里改，读之前一律先快照
         self.show_index = True
@@ -1442,7 +1450,7 @@ class Fetcher(QThread):
             if self._stop:
                 return
             if rows or idx:
-                self._fill_spark(rows, spark_enabled, fast, source)
+                self._fill_spark(rows, spark_enabled, fast, source, generation)
                 self.data_ready.emit({"generation": generation,
                                       "rows": rows, "idx": idx})
 
@@ -1467,7 +1475,16 @@ class Fetcher(QThread):
         self._fail_count = 0
         return rows
 
-    def _fill_spark(self, rows, spark_enabled, fast, source):
+    def _spark_entry(self, full, source, generation):
+        """同一身份（**同一个源 + 同一代**）的缓存条目，不看过期。"""
+        hit = self._spark_cache.get(full)
+        if not hit:
+            return None
+        if hit.get("source") != source or hit.get("generation") != generation:
+            return None
+        return hit
+
+    def _fill_spark(self, rows, spark_enabled, fast, source, generation):
         """分时走势填进 rows。关掉分时就不发请求，缓存没过期也不发。"""
         if not spark_enabled:
             for r in rows:
@@ -1475,13 +1492,14 @@ class Fetcher(QThread):
             return
         if self._spark_tick > 0:
             for r in rows:
-                r["spark"] = (self._spark_cache.get(r.get("full")) or [None, None])[1]
+                hit = self._spark_entry(r.get("full"), source, generation)
+                r["spark"] = (hit or {}).get("pts")
             return
         for r in rows:
             if self._stop:              # 退出时别再一只只地慢慢拉
                 return
-            r["spark"] = self._spark(r.get("full"), source)
-        self._spark_tick = max(1, int(300 / max(fast, 1)))
+            r["spark"] = self._spark(r.get("full"), source, generation)
+        self._spark_tick = max(1, int(self.SPARK_TTL / max(fast, 1)))
 
     def _next_interval(self, fast):
         """连续失败就退避，避免断网时死命重试；恢复成功后自动回到正常频率"""
@@ -1490,22 +1508,41 @@ class Fetcher(QThread):
             interval = max(interval, 30)
         return interval
 
-    def _spark(self, full, source):
-        """分时走势，5 分钟缓存一次；这次拿不到就先用上次的，还没有才 None"""
+    def _spark(self, full, source, generation):
+        """分时走势，缓存 SPARK_TTL 秒；这次拿不到就先用上次的（同一身份的）。
+
+        ★ 为什么缓存条目必须带 (source, generation)：
+        网络请求期间是不持锁的。旧请求在途时用户切了源 —— 切源会 generation+1
+        并 clear_spark_cache()，但**旧请求回来之后会把它的结果再写一遍**，
+        于是刚清掉的缓存又长回来了，而且装的是旧源的走势。新源下一轮读到它，
+        直接命中、不再发请求 —— 价格是新源的，迷你分时却是旧源画的，
+        最长能吃满整个 TTL。
+
+        generation 机制保护的是 rows（旧整批结果会被 UI 丢掉），没保护
+        spark cache。所以这里两道保险都要有：
+          1) entry 带身份，旧身份的 entry 永远不会被新身份命中
+          2) 网络返回后、写缓存之前，重新确认身份没变
+        """
         if not full:
             return None
-        now = time.time()
-        hit = self._spark_cache.get(full)
-        if hit and now - hit[0] < 300:
-            return hit[1]
+        entry = self._spark_entry(full, source, generation)
+        if entry and time.time() - entry.get("ts", 0) < self.SPARK_TTL:
+            return entry.get("pts")
         try:
             pts = providers.fetch_spark(full, prefer=source)
-            if pts and len(pts) >= 2:
-                self._spark_cache[full] = (now, pts)
-                return pts
+            got = pts if (pts and len(pts) >= 2) else None
         except Exception:
-            pass
-        return hit[1] if hit else None
+            got = None
+        # 网络回来了，世界可能已经变了：这中间用户可能切了源、换了自选。
+        # 从那一刻起旧请求的结果就不属于当前身份，既不能写进缓存也不能用。
+        with self._state_lock:
+            if generation != self._generation or source != self.source:
+                return None
+        if got:
+            self._spark_cache[full] = {"ts": time.time(), "source": source,
+                                       "generation": generation, "pts": got}
+            return got
+        return (entry or {}).get("pts")     # 这次没拿到，先用上次的（同身份）
 
 
 class Searcher(QThread):
@@ -3059,7 +3096,7 @@ class Ticker(QWidget):
                           ("±3%", 3.0), ("±5%", 5.0)],
                          float(self.cfg.get("alert_pct") or 0), self.set_alert)
 
-        self._check_menu(m, "收盘彩蛋阈值（14:57）",
+        self._check_menu(m, "收盘彩蛋阈值（14:57–15:00）",
                          [("关闭", 0.0), ("±2%", 2.0), ("±3%", 3.0), ("±5%", 5.0)],
                          float(self.cfg.get("effect_pct") or 0), self.set_effect_pct)
 

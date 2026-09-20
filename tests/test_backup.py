@@ -11,6 +11,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import widget as W  # noqa: E402
+import safety_guard  # noqa: E402
 
 ok = fail = 0
 
@@ -111,15 +112,7 @@ W.save_config({"title": "via save_config", "codes": ["sh600519"]})
 chk("save_config 触发快照", len(W.list_snapshots()) == n0 + 1, str(len(W.list_snapshots())))
 
 print("== 11. 真实配置没被碰 ==")
-real = os.path.join(os.path.dirname(os.path.abspath(W.__file__)), "stocks.json")
-if os.path.exists(real):
-    chk("真实 stocks.json 仍在", True)
-else:
-    print("  SKIP  本机没有 stocks.json（干净 checkout 的正常状态）")
-real_bak = os.path.join(os.path.dirname(real), "backups")
-_before = set(os.listdir(real_bak)) if os.path.isdir(real_bak) else set()
-chk("真实 backups/ 未被测试新增文件",
-    (set(os.listdir(real_bak)) if os.path.isdir(real_bak) else set()) == _before, "前后不一致")
+safety_guard.check_after(chk)
 
 print("\n%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

@@ -12,6 +12,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import widget as W  # noqa: E402
+import safety_guard  # noqa: E402
 from PySide6.QtCore import Qt, QEvent, QPointF  # noqa: E402
 from PySide6.QtGui import QKeyEvent, QMouseEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMenu  # noqa: E402
@@ -305,15 +306,7 @@ chk("能生成快照", bool(p) and os.path.exists(p))
 chk("快照目录跟着 CONFIG_PATH", os.path.dirname(p) == os.path.join(tmp, "backups"), p)
 
 print("== 真实配置未被改动 ==")
-if REAL is None:
-    print("  SKIP  本机没有 stocks.json（干净 checkout 的正常状态）")
-else:
-    chk("真实 stocks.json 原样", io.open(real_cfg, encoding="utf-8").read() == REAL)
-real_bak = os.path.join(os.path.dirname(real_cfg), "backups")
-_before = set(os.listdir(real_bak)) if os.path.isdir(real_bak) else set()
-chk("真实 backups/ 未被测试新增文件",
-    (set(os.listdir(real_bak)) if os.path.isdir(real_bak) else set()) == _before,
-    "前后不一致")
+safety_guard.check_after(chk)
 
 print("\n%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

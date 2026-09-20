@@ -9,6 +9,7 @@ from datetime import date
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import widget as W  # noqa: E402
+import safety_guard  # noqa: E402
 
 ok = fail = 0
 
@@ -156,10 +157,7 @@ except Exception as e:
     chk("9 种飘落物都能画出来", False, repr(e))
 
 print("== 9. 真实配置未动 ==")
-if REAL is None:
-    print("  SKIP  本机没有 stocks.json（干净 checkout 的正常状态）")
-else:
-    chk("真实 stocks.json 原样", io.open(real, encoding="utf-8").read() == REAL)
+safety_guard.check_after(chk)
 
 print("\n%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

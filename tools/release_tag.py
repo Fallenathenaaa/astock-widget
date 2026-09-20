@@ -43,6 +43,10 @@ from release_check import read_version, tag_name  # noqa: E402
 BODY_FILE = os.path.join(ROOT, ".release_body.md")
 PY = sys.executable
 
+# 发版门槛只认这个 workflow —— 对应 .github/workflows/test.yml 里的 `name:`
+# 改了 workflow 的名字，这里要跟着改（宁可显式，不要"随便找一个 run"）
+TEST_WORKFLOW = "test"
+
 
 def remote_head(token):
     """远端 main 的 HEAD。
@@ -55,21 +59,50 @@ def remote_head(token):
     return ref.get("object", {}).get("sha", "") if code == 200 else ""
 
 
-def tag_sha(tag, token):
-    """远端这个 tag 指向哪个 commit；不存在返回 ""，查不清返回 None。"""
-    for i in range(6):
+def tag_sha(tag, token, retry_on_404=False):
+    """远端这个 tag 指向哪个 commit；不存在返回 ""，查不清返回 None。
+
+    retry_on_404 只在**我们刚 POST 完 tag** 时才需要：GitHub 的 ref 有一小段
+    收敛时间，立刻查可能还 404。
+
+    发版之前（还没写任何东西）404 就是不存在，绝不多等 —— 那 15 秒既没意义，
+    又白白把「读到 main SHA」到「真正打 tag」之间的 TOCTOU 窗口拉长。
+    """
+    tries = 6 if retry_on_404 else 1
+    for i in range(tries):
         code, out = http("GET", "/repos/%s/%s/git/refs/tags/%s" % (OWNER, REPO, tag),
                          token=token)
         if code == 200:
             return out.get("object", {}).get("sha", "")
         if code == 404:
-            if i < 5:
+            if retry_on_404 and i < tries - 1:
                 time.sleep(3)          # 刚推完的瞬间可能还查不到
                 continue
             return ""
         print("  查 tag 失败：HTTP %s" % code)
         return None                    # 查不清 ≠ 不存在，别乱建
     return ""
+
+
+def confirm_main(sha, token, when):
+    """把远端 main 和发版开始时读到的 SHA 对一遍，变了就停止。
+
+    从「读到 main = A」到「真正 POST tag」之间隔着查 tag、查 Release、读正文、
+    查 CI 好几步。这中间另一个 push 可能把 main 推到 B。不复核的话脚本会自己
+    制造出一个不一致：
+
+        main = B，但 v2.1.3 tag 打在 A 上
+
+    Release 看起来是"最新版"，实际不是当前 main。push_github.py 提交前一刻
+    会重读 remote HEAD，发版这一步也得一样。
+    """
+    now = remote_head(token)
+    if not now:
+        sys.exit("%s：读不到远端 main 的 HEAD" % when)
+    if now != sha:
+        sys.exit("%s：main 已经变了\n    %s（开始时）-> %s（现在）\n"
+                 "重跑一次发版流程 —— tag 只能打在当前的 main 上。" % (when, sha, now))
+    return now
 
 
 def release_exists(tag, token):
@@ -94,10 +127,13 @@ def ci_verdict(sha, token):
                      % (OWNER, REPO, sha), token=token)
     if code != 200:
         return "unknown", "查不到 Actions 记录（HTTP %s）" % code
+    # 只认 TEST_WORKFLOW。今天仓库里只有它一个，所以「找不到就退到任意 run」
+    # 看起来无害 —— 但将来多了 docs / lint / screenshot / release 之类，
+    # 拿一个不相干的 workflow 的结论当发版门槛，而且很难被发现。找不到就说找不到。
     runs = [r for r in out.get("workflow_runs", [])
-            if r.get("name") == "test"] or out.get("workflow_runs", [])
+            if r.get("name") == TEST_WORKFLOW]
     if not runs:
-        return "unknown", "这个 commit 还没有 Actions 记录"
+        return "unknown", "没找到 %s workflow 在这个 commit 上的运行记录" % TEST_WORKFLOW
     run = runs[0]
     if run.get("status") != "completed":
         return "pending", "Actions 还在跑（%s）" % run.get("status")
@@ -190,7 +226,12 @@ def main(argv=None):
         print("\n--dry-run：什么都没改。真跑会%s"
               % ("只 POST 新 Release（tag 已经有了）" if have_tag
                  else "依次 POST 新 tag -> POST 新 Release"))
+        print("（真跑时还会在写之前再核一次 main 是不是还是 %s）" % sha[:8])
         return 0
+
+    # ★ 写之前最后再确认一次 main 没变。上面这一串查询可能花了不少时间，
+    # 这期间另一个 push 完全来得及把 main 推走。
+    confirm_main(sha, token, "建 tag 前")
 
     if not have_tag:
         code, out = http("POST", "/repos/%s/%s/git/refs" % (OWNER, REPO),
@@ -200,6 +241,14 @@ def main(argv=None):
             sys.exit("建 tag 失败：%s\n"
                      "（如果这里失败而 Release 也没建，下次重跑会自动续上）"
                      % out.get("message"))
+        # tag 建完之后才需要容忍 eventual consistency：刚写的 ref 可能还查不到
+        wrote = tag_sha(tag, token, retry_on_404=True)
+        if wrote and wrote != sha:
+            sys.exit("刚建好的 tag 指向 %s，不是我们想要的 %s —— 停下，"
+                     "别再往下建 Release。" % (wrote, sha))
+
+    # 建 Release 之前再核一次：tag 那一步之后 main 也可能已经动了
+    confirm_main(sha, token, "建 Release 前")
 
     code, out = http("POST", "/repos/%s/%s/releases" % (OWNER, REPO),
                      {"tag_name": tag, "name": tag, "draft": False,

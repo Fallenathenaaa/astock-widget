@@ -52,8 +52,30 @@ if not exist "%PYEXE%" (
   exit /b 1
 )
 
-echo Python version in .venv:
-"%PYEXE%" -c "import sys; print('  %d.%d.%d' % sys.version_info[:3])"
+rem ---- also gate an EXISTING .venv ----
+rem Picking a good interpreter only when the venv does not exist yet is not
+rem enough: an upgrading user already has .venv, and early versions of this
+rem project allowed Python 3.8+. A 3.8/3.9 venv would be reused as is --
+rem install goes green, start only checks "import PySide6" (which an old env
+rem may well have), and the 3.10-3.14 range in the README becomes a lie.
+rem Report the problem instead of silently reusing it (never delete a user's
+rem .venv behind their back).
+"%PYEXE%" "%~dp0tools\check_python.py"
+if errorlevel 1 (
+  echo.
+  echo FAILED: this .venv uses an unsupported Python version.
+  echo          This project needs Python 3.10 - 3.14.
+  echo.
+  echo To fix it (three steps, about one minute):
+  echo   1. Close this window.
+  echo   2. Delete the ".venv" folder in this directory.
+  echo   3. Double-click install.bat again.
+  echo.
+  echo Nothing else is touched: stocks.json, backups and logs all stay as they are.
+  echo (The old .venv is not deleted automatically -- that is your call.)
+  pause
+  exit /b 1
+)
 
 echo Installing dependencies from requirements.txt ...
 "%PYEXE%" -m pip install -r "%~dp0requirements.txt" -i https://mirrors.aliyun.com/pypi/simple/
@@ -68,8 +90,11 @@ if errorlevel 1 (
   echo.
   echo FAILED. In China try another mirror:
   echo   "%PYEXE%" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-) else (
   echo.
-  echo Done. You can now run start.bat
+  pause
+  exit /b 1
 )
+echo.
+echo Done. You can now run start.bat
 pause
+exit /b 0

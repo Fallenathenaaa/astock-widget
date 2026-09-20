@@ -22,6 +22,19 @@ if not exist "%PYEXE%" (
   pause
   exit /b 1
 )
+rem Same version gate as install.bat: an old .venv (3.8/3.9 from early
+rem versions) must not sneak through just because PySide6 happens to import.
+"%PYEXE%" "%~dp0tools\check_python.py"
+if errorlevel 1 (
+  echo.
+  echo FAILED: this .venv uses an unsupported Python version.
+  echo          This project needs Python 3.10 - 3.14.
+  echo.
+  echo Fix it by running install.bat -- it will tell you exactly what to do.
+  pause
+  exit /b 1
+)
+
 rem Deps present? Not a version question -- just "can it import PySide6".
 rem If not, hand the whole job back to install.bat instead of inventing a
 rem second, weaker install path here (it used to try one single mirror and

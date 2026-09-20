@@ -45,6 +45,32 @@ try:
     chk("没成交 = 停牌", P.quote_status(10.5, 0, 11.0, 9.0) == P.HALT)
     chk("现价为 0 = 停牌", P.quote_status(0, 100, 11.0, 9.0) == P.HALT)
     chk("没有涨跌停价时只判停牌", P.quote_status(10.5, 100, 0, 0) == P.NORMAL)
+    # 推算出来的涨跌停价不能驱动权威徽标：guess_limit 是近似规则（板块百分比），
+    # 覆盖不了无涨跌幅限制 / 特殊状态 / 临时规则。拿它当判据 = 把近似值包装成
+    # 一个看起来确定的「涨停」，而用户看不出那是估的。不确定就少说。
+    chk("推算的涨停价 → 不判涨停",
+        P.quote_status(11.0, 100, 11.0, 9.0, trust_limits=False) == P.NORMAL,
+        P.quote_status(11.0, 100, 11.0, 9.0, trust_limits=False))
+    chk("推算的跌停价 → 不判跌停",
+        P.quote_status(9.0, 100, 11.0, 9.0, trust_limits=False) == P.NORMAL)
+    chk("接口给的涨停价 → 照常判涨停",
+        P.quote_status(11.0, 100, 11.0, 9.0, trust_limits=True) == P.LIMIT_UP)
+    chk("接口给的跌停价 → 照常判跌停",
+        P.quote_status(9.0, 100, 11.0, 9.0, trust_limits=True) == P.LIMIT_DN)
+    chk("不信任涨跌停价时，停牌照样判得出来",
+        P.quote_status(10.5, 0, 11.0, 9.0, trust_limits=False) == P.HALT)
+    chk("不信任涨跌停价时，现价为 0 照样判停牌",
+        P.quote_status(0, 100, 11.0, 9.0, trust_limits=False) == P.HALT)
+    chk("不信任涨跌停价 + 缺成交量 → 正常",
+        P.quote_status(10.5, None, 11.0, 9.0, trust_limits=False) == P.NORMAL)
+    # make_quote 必须把 limit_estimated 和 trust_limits 对上，不能各说各话
+    _q1 = P.make_quote("sz000001", "000001", "平安银行", 11.0, 10.0, volume=100)
+    chk("没给涨跌停价 → estimated 且不判涨跌停",
+        _q1["limit_estimated"] is True and _q1["status"] == P.NORMAL, _q1["status"])
+    _q2 = P.make_quote("sz000001", "000001", "平安银行", 11.0, 10.0, volume=100,
+                       limit_up=11.0, limit_dn=9.0)
+    chk("给了涨跌停价 → 不 estimated 且照常判涨停",
+        _q2["limit_estimated"] is False and _q2["status"] == P.LIMIT_UP, _q2["status"])
     market_clock.has_session_started = lambda *a, **k: False
     chk("盘前成交量 0 不算停牌", P.quote_status(10.5, 0, 11.0, 9.0) == P.NORMAL)
 finally:
@@ -65,6 +91,24 @@ chk("普通股报 2 位小数",
 chk("昨收为 0 是废数据", P.make_quote("sh600519", "600519", "某某", 1.0, 0) is None)
 chk("没有 full 也是废数据", P.make_quote("", "600519", "某某", 1.0, 10.0) is None)
 chk("乱字段不炸", P.make_quote("sh600519", "600519", "某某", "abc", "10.0")["price"] == 0.0)
+
+print("== 来自网络的数字一律 finite-aware ==")
+# 配置端已经挡住了 ±inf，网络端也得挡：接口给个 1e999 或 400 位数字，
+# 让 inf 流进 price / pct / 涨跌停比较，后面全是 inf 传播。
+chk("_num(inf) 兜成默认", P._num(float("inf")) == 0.0)
+chk("_num(-inf) 兜成默认", P._num(float("-inf")) == 0.0)
+chk("_num('1e999') 兜成默认", P._num("1e999") == 0.0)
+chk("_num 超大整数兜成默认（OverflowError）", P._num(10 ** 400) == 0.0)
+chk("_num 认得出来的照常", P._num("12.5") == 12.5)
+chk("_num 的 default 可以是 None（分时线用它过滤废点）",
+    P._num("abc", None) is None)
+chk("_num 空白兜成默认", P._num("") == 0.0 and P._num(None) == 0.0)
+chk("_opt_num 缺失 → None", P._opt_num("") is None and P._opt_num(None) is None)
+for bad in ["abc", "--", "nan", "inf", "-inf", "1e999"]:
+    chk("_opt_num(%r) → None（不是 0）" % bad, P._opt_num(bad) is None, P._opt_num(bad))
+chk("_opt_num 超大整数 → None", P._opt_num(10 ** 400) is None)
+chk("_opt_num 真实的 0 仍然是 0.0", P._opt_num("0") == 0.0)
+chk("_opt_num 正常值照常", P._opt_num("123456") == 123456.0)
 
 print("== 来源标记 / 涨跌停价是不是推算的 ==")
 # 一屏里可能混着两个源的数据（主源漏一只、备源补上），出偏差要能问出

@@ -7,6 +7,7 @@ widget.py 只认三个入口：fetch_quotes / search_stocks / fetch_spark，
 加新源 = 写一个 Provider 子类 + 注册进 PROVIDERS，别处一行都不用改。
 """
 import json
+import math
 import re
 import urllib.parse
 import urllib.request
@@ -43,26 +44,49 @@ def http_get(url, timeout=HTTP_TIMEOUT, headers=None):
 # ---------------- 归一化的小工具 ----------------
 
 def _num(v, default=0.0):
-    """字段转 float：空白 / 非数字 / NaN 全部兜成 default。"""
+    """网络字段转 float。凡是来自网络的数字，一律 finite-aware。
+
+    只挡 NaN 是不够的，两种东西会从缝里漏进来：
+      - `1e999` 这种写法 float() 老实解析成 inf
+      - 超大整数（JSON 里的 400 位数字）float() 直接抛 **OverflowError**
+
+    它们一旦进了 price / prev / pct / 涨跌停比较，后面全是 inf 传播：
+    涨跌额变 inf、盈亏算不出来、绘制时格式化出 "inf"。既然这一层就是
+    "把不可信的东西变成可信的"的边界，就该在这里挡干净。
+
+    default 传 None 时表示"这一项没有"，调用方用它过滤掉废点（分时线在用）。
+    """
     try:
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
-    return f if f == f else default
+    return f if math.isfinite(f) else default
 
 
 def _opt_num(v):
-    """字段转 float，但**缺失**和**0**要分开：缺失返回 None，非数字返回 0.0。
+    """字段转 float，但**"没给"**和**"给了 0"**必须分开。
 
-    成交量是唯一需要区分的字段：截断响应里根本没有成交量这一列，拿它当 0
+        missing（字段不存在 / 空串）  -> None
+        malformed（"abc" / "--"）     -> None
+        NaN / ±inf                    -> None
+        真实的 "0"                    -> 0.0
+
+    成交量是唯一需要区分的字段：截断响应里根本没有成交量那一列，拿它当 0
     会让 quote_status 判成"今天一股没成交 → 停牌"，界面上价格直接变 `--`、
-    涨跌额和盈亏一起被藏掉。没给就是没给，不能替它回答"是 0"。
+    涨跌额和盈亏一起被藏掉。
+
+    同理，接口给了个畸形值（"--" 是真实见过的占位符）也不代表成交量真是 0
+    —— 那只是"这一列读不出来"。没给就是没给，不能替它回答"是 0"。
     """
     if v is None:
         return None
     if isinstance(v, str) and v.strip() == "":
         return None
-    return _num(v)
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _field(f, i):
@@ -98,21 +122,31 @@ def guess_limit(code, name, prev):
     return round(prev * (1 + pct), 2), round(prev * (1 - pct), 2)
 
 
-def quote_status(price, volume, limit_up, limit_dn):
+def quote_status(price, volume, limit_up, limit_dn, trust_limits=True):
     """停牌 / 涨停 / 跌停 / 正常，一次性判好，调用方不用再算。
 
     停牌的判据是「今天该有成交却一股没有」。盘前成交量必然是 0，
     那时不算停牌（见 market_clock.has_session_started）。
 
-    volume 为 None 表示"这一列接口没给"（响应被截断），**不是**成交量为 0，
+    volume 为 None 表示"这一列接口没给"（响应被截断或畸形），**不是**成交量为 0，
     这种情况不许判停牌 —— 那会把一只正常交易的股票显示成停牌。
+
+    ★ trust_limits=False 表示涨跌停价**不是接口给的**，是我们按板块规则
+    推算的（新浪不给这两个字段）。这时不产生 LIMIT_UP / LIMIT_DN ——
+    只保留停牌判定，其余一律 NORMAL。
+
+    理由：guess_limit() 是近似规则（主板 10% / ST 5% / 创业板科创板 20% /
+    北交所 30%），覆盖不了上市初期无涨跌幅限制、特殊交易状态、临时规则、
+    取整差异。它算出来的价被拿去当判据，等于把近似值包装成一个看起来
+    确定的「涨停」徽标，用户还看不出那是估的。**不确定就少说。**
     """
     if price <= 0:
         return HALT
-    if limit_up > 0 and price >= limit_up - 1e-6:
-        return LIMIT_UP
-    if limit_dn > 0 and price <= limit_dn + 1e-6:
-        return LIMIT_DN
+    if trust_limits:
+        if limit_up > 0 and price >= limit_up - 1e-6:
+            return LIMIT_UP
+        if limit_dn > 0 and price <= limit_dn + 1e-6:
+            return LIMIT_DN
     if volume is not None and volume <= 0 and market_clock.has_session_started():
         return HALT
     return NORMAL
@@ -166,7 +200,9 @@ def make_quote(full, code, name, price, prev, high=0.0, low=0.0, open_=0.0,
         "limit_dn": limit_dn,
         "limit_estimated": not limit_given,
         "provider": provider or "",
-        "status": quote_status(price, volume, limit_up, limit_dn),
+        # 推算出来的涨跌停价只留作参考，不参与 authoritative 的涨跌停判定
+        "status": quote_status(price, volume, limit_up, limit_dn,
+                               trust_limits=limit_given),
     }
 
 

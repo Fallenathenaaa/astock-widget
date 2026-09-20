@@ -10,6 +10,7 @@ import tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import widget as W  # noqa: E402
+import safety_guard  # noqa: E402
 
 ok = fail = 0
 
@@ -93,10 +94,7 @@ chk("返回默认配置", cfg.get("title") == W.DEFAULT_CONFIG["title"])
 chk("没去翻备份", W._recovered_from is None)
 
 print("== 7. 真实配置未被改动 ==")
-if REAL is None:
-    print("  SKIP  本机没有 stocks.json（干净 checkout 的正常状态）")
-else:
-    chk("真实 stocks.json 原样", io.open(real_cfg, encoding="utf-8").read() == REAL)
+safety_guard.check_after(chk)
 
 print("\n%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

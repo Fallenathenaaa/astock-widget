@@ -46,18 +46,26 @@ class FakeAPI:
     """按路径返回假响应的 http()。顺手记下每一次调用。"""
 
     def __init__(self, tag_sha=None, release=True, runs=None, jobs=None,
-                 ref_status=200):
+                 ref_status=200, head_seq=None):
         self.tag_sha = tag_sha          # None = 404 不存在
         self.release = release
         self.runs = runs if runs is not None else []
         self.jobs = jobs if jobs is not None else []
         self.ref_status = ref_status
+        # 每次查 main 依次返回这里的 sha（用来模拟"发版期间 main 变了"）；
+        # 用完了就一直给最后一个
+        self.head_seq = list(head_seq) if head_seq else None
         self.calls = []
 
     def __call__(self, method, path, body=None, token="", retries=3):
         self.calls.append((method, path, body))
         if method == "GET" and "/git/refs/heads/main" in path:
-            return 200, {"object": {"sha": HEAD}}
+            if self.head_seq:
+                sha = self.head_seq.pop(0) if len(self.head_seq) > 1 \
+                    else self.head_seq[0]
+            else:
+                sha = HEAD
+            return 200, {"object": {"sha": sha}}
         if method == "GET" and "/git/refs/tags/" in path:
             if self.tag_sha is None:
                 return 404, {"message": "Not Found"}
@@ -203,6 +211,48 @@ chk("Actions 红了 → 连 tag 都不建", not posted(api, "tag"), posted(api, 
 api = FakeAPI(tag_sha=None, release=False, runs=[])
 rc, msg = run_main(["--no-preflight"], api)
 chk("CI 还没跑 → 不拦但建得下去", rc == 0, msg)
+
+print("== 写之前再核一次 main（TOCTOU）==")
+# 从"读到 main=A"到"POST tag"之间隔着查 tag / 查 Release / 读正文 / 查 CI。
+# 这期间另一个 push 完全来得及把 main 推到 B。不复核就会打出
+# "main = B，tag 打在 A 上" —— Release 看着是最新版，其实不是当前 main。
+api = FakeAPI(tag_sha=None, release=False, head_seq=[HEAD, OTHER])
+rc, msg = run_main(["--no-preflight"], api)
+chk("main 在发版期间变了 → 拒绝", rc == 1 and "main 已经变了" in msg, msg)
+chk("拒绝时一个写操作都没发",
+    not posted(api, "tag") and not posted(api, "release"), api.calls)
+
+api = FakeAPI(tag_sha=None, release=False, head_seq=[HEAD])
+rc, msg = run_main(["--no-preflight"], api)
+chk("main 一直没变 → 正常发", rc == 0, msg)
+chk("正常发时 tag 和 Release 都建了",
+    len(posted(api, "tag")) == 1 and len(posted(api, "release")) == 1, api.calls)
+
+# 孤儿 tag 续建也要核：tag 是我们的，但 main 可能已经不是 tag 那个了
+api = FakeAPI(tag_sha=HEAD, release=False, head_seq=[HEAD, OTHER])
+rc, msg = run_main(["--no-preflight"], api)
+chk("补建 Release 前也核 main", rc == 1 and "main 已经变了" in msg, msg)
+chk("核不过就不建 Release", not posted(api, "release"), api.calls)
+
+print("== 发版前查 tag 不该白等 15 秒 ==")
+# eventual consistency 只适用于"我们刚 POST 完"。还没写任何东西时的 404
+# 就是不存在 —— 等 15 秒既没意义，又把 TOCTOU 窗口拉长。
+api = FakeAPI(tag_sha=None, release=False)
+run_main(["--dry-run", "--no-preflight"], api)
+gets = [c for c in api.calls if c[0] == "GET" and "/git/refs/tags/" in c[1]]
+chk("发版前查 tag 只问一次", len(gets) == 1, len(gets))
+
+print("== CI 结论只认 test workflow ==")
+chk("只有别的 workflow → unknown（不拿它当发版门槛）",
+    verdict_with([{"name": "docs", "status": "completed",
+                   "conclusion": "failure", "id": 9}])[0] == "unknown",
+    verdict_with([{"name": "docs", "status": "completed",
+                   "conclusion": "failure", "id": 9}]))
+chk("test 和别的混着时只认 test",
+    verdict_with([{"name": "docs", "status": "completed",
+                   "conclusion": "failure", "id": 9},
+                  {"name": "test", "status": "completed",
+                   "conclusion": "success", "id": 8}])[0] == "success")
 
 print("== move_tag 不该再出现（已发布的 tag 不许挪） ==")
 chk("tools/ 里没有 move_tag.py",

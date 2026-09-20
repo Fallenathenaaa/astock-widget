@@ -9,6 +9,7 @@ import tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import widget as W  # noqa: E402
+import safety_guard  # noqa: E402
 from PySide6.QtCore import QPoint  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -110,10 +111,7 @@ with io.open(W.CONFIG_PATH, encoding="utf-8") as f:
     chk("写进配置文件", json.load(f).get("snap") is True)
 
 print("== 7. 真实配置未被改动 ==")
-if REAL is None:
-    print("  SKIP  本机没有 stocks.json（干净 checkout 的正常状态）")
-else:
-    chk("真实 stocks.json 原样", io.open(real_cfg, encoding="utf-8").read() == REAL)
+safety_guard.check_after(chk)
 
 print("\n%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

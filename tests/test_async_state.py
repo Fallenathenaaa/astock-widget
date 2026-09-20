@@ -13,6 +13,7 @@ import sys
 import copy
 import json
 import tempfile
+import threading
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -323,6 +324,91 @@ chk("旧源的行情不进界面", w.rows == [], w.rows)
 emit([row("sh600519", "600519", "贵州茅台", 1.1)], gen=gen_b)
 chk("新源的行情照常收下", len(w.rows) == 1, w.rows)
 w.set_data_source("auto")
+
+print("== 切数据源后，旧源的分时不能污染新源的缓存 ==")
+# generation 保护的是 rows（旧整批结果会被 UI 丢掉），没保护 spark cache：
+# 旧请求在途时切源，切源会 generation+1 并清空缓存，但**旧请求回来之后会
+# 把它的结果再写一遍** —— 刚清掉的缓存又长回来，装的是旧源的走势。新源
+# 下一轮读到它直接命中、不再发请求。价格是新源的，迷你分时是旧源画的。
+#
+# 用 Event 卡住时序，不用 sleep 猜：让旧请求精确地停在"网络已发出、还没返回"。
+_real_spark = W.providers.fetch_spark
+calls = []
+f = W.Fetcher()
+f.set_codes(["sh600519"])
+gen_t = f._generation
+
+
+def fake_spark(full, prefer="auto"):
+    calls.append((full, prefer))
+    if len(calls) == 1:              # 第一通（旧源）卡住，等切完源再放行
+        started.set()
+        release.wait(5)
+    return [10.0, 10.2, 10.1] if prefer == "tencent" else [20.0, 20.5, 20.3]
+
+
+started, release = threading.Event(), threading.Event()
+W.providers.fetch_spark = fake_spark
+box = {}
+t = threading.Thread(
+    target=lambda: box.update(v=f._spark("sh600519", "tencent", gen_t)))
+t.start()
+try:
+    chk("旧请求确实卡在网络里", started.wait(5))
+
+    # 用户此刻切源：generation+1 + 清空缓存
+    f.set_source("sina")
+    f.clear_spark_cache()
+    gen_s = f._generation
+    release.set()
+    t.join(5)
+
+    chk("切源 → generation +1", gen_s == gen_t + 1, (gen_t, gen_s))
+    chk("旧请求放弃了它的结果（身份已经变了）", box.get("v") is None, box.get("v"))
+    chk("旧源的结果没被写回缓存", f._spark_cache.get("sh600519") is None,
+        f._spark_cache)
+
+    calls.clear()
+    pts_s = f._spark("sh600519", "sina", gen_s)
+    chk("新源没命中旧缓存，真的发了请求", ("sh600519", "sina") in calls, calls)
+    chk("新源拿到的是新源的走势", pts_s == [20.0, 20.5, 20.3], pts_s)
+    entry = f._spark_cache.get("sh600519") or {}
+    chk("缓存条目记着自己的身份",
+        entry.get("source") == "sina" and entry.get("generation") == gen_s, entry)
+
+    calls.clear()
+    chk("同一身份第二次命中缓存", f._spark("sh600519", "sina", gen_s) == pts_s)
+    chk("命中缓存就不再发请求", calls == [], calls)
+
+    # 换回腾讯（又一代）→ 新浪那条不该被命中
+    calls.clear()
+    f.set_source("tencent")
+    gen_t2 = f._generation
+    pts_t = f._spark("sh600519", "tencent", gen_t2)
+    chk("切回腾讯后拿到的确实是腾讯的走势", pts_t == [10.0, 10.2, 10.1], pts_t)
+finally:
+    release.set()
+    t.join(5)
+    f._stop = True
+    W.providers.fetch_spark = _real_spark
+
+print("== 换自选股也要让旧分时失效 ==")
+f2 = W.Fetcher()
+f2.set_codes(["sh600519"])
+gen1 = f2._generation
+f2._spark_cache["sh600519"] = {"ts": time.time(), "source": "auto",
+                               "generation": gen1, "pts": [1.0, 2.0, 3.0]}
+f2.set_codes(["sz000001"])          # 换自选 → 又一代
+gen2 = f2._generation
+chk("换自选 → generation +1", gen2 == gen1 + 1, (gen1, gen2))
+calls.clear()
+W.providers.fetch_spark = fake_spark
+try:
+    pts = f2._spark("sh600519", "auto", gen2)
+    chk("换自选后旧分时不再命中（重新去拉）", calls != [], calls)
+finally:
+    W.providers.fetch_spark = _real_spark
+    f2._stop = True
 
 print()
 print("%d passed, %d failed" % (ok, fail))

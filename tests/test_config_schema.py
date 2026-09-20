@@ -295,6 +295,52 @@ chk("正常那条不会被误伤",
     == {"sh600519": {"cost": 1250.0}, "sz000001": {"cost": 11.5, "shares": 1000}},
     W.parse_positions("600519=1250, 000001=11.5:1000"))
 
+print("== 字符串字段的 null 不等于字面量 \"None\" ==")
+# str(None) == "None"。配置里写 "title": null 是"没写"的意思，
+# 直接 str() 会让标题栏上出现 None 三个字母。
+chk("title=null → 默认标题",
+    W.validate_config({"title": None})["title"] == W.DEFAULT_CONFIG["title"],
+    W.validate_config({"title": None})["title"])
+chk("title 正常值照常", W.validate_config({"title": "我的盯盘"})["title"] == "我的盯盘")
+chk("data_source=null → auto",
+    W.validate_config({"data_source": None})["data_source"] == "auto")
+chk("boss_key=null → 默认老板键",
+    W.validate_config({"boss_key": None})["boss_key"] == W.DEFAULT_BOSS_KEY)
+chk("真从 JSON 走一遍",
+    W.validate_config(json.loads('{"title": null}'))["title"]
+    == W.DEFAULT_CONFIG["title"])
+chk("超长标题仍然截断", len(W.validate_config({"title": "x" * 50})["title"]) == 12)
+
+print("== 超大整数不能把整份持仓清空 ==")
+# float(10**400) 抛的是 **OverflowError**。_finite_positive 自己写 float(v)
+# 那版只兜了 (TypeError, ValueError)，于是 sanitize_positions 整体炸出来，
+# 被 validate_config 外层一兜 —— 结果是连合法的 sh600519 一起丢光，
+# 正好违背"坏一条只丢一条"。
+huge = 10 ** 400
+out = W.validate_config({"positions": {"sh600519": {"cost": 1250.0},
+                                       "sz000001": {"cost": huge}}})["positions"]
+chk("成本是 400 位整数 → 只丢那一条", out == {"sh600519": {"cost": 1250.0}}, out)
+out = W.validate_config({"positions": {"sh600519": {"cost": 1250.0,
+                                                    "shares": huge}}})["positions"]
+chk("股数是 400 位整数 → 只丢股数，成本留着",
+    out == {"sh600519": {"cost": 1250.0}}, out)
+out = W.validate_config({"positions": {"sh600519": {"cost": huge},
+                                       "sz000001": {"cost": 11.5}}})["positions"]
+chk("坏的在前面也不连累后面的", out == {"sz000001": {"cost": 11.5}}, out)
+# 真从 JSON 文本走一遍：json.loads 会把 400 位数字解析成 int（Python 整数任意精度），
+# 不是 float —— 这条才是对着真实入口的
+raw = json.loads('{"positions": {"sh600519": {"cost": 1250},'
+                 ' "sz000001": {"cost": ' + "9" * 400 + '}}}')
+out = W.validate_config(raw)["positions"]
+chk("JSON 里的 400 位整数也只丢那一条", out == {"sh600519": {"cost": 1250.0}}, out)
+chk("_finite_positive 挡得住超大整数", W._finite_positive(10 ** 400) is None)
+chk("_finite_positive 仍然要求为正",
+    W._finite_positive(0) is None and W._finite_positive(-1) is None
+    and W._finite_positive(1250) == 1250.0)
+chk("_finite_positive 和 _finite_number 是同一套判据",
+    W._finite_positive(float("inf")) is None and W._finite_positive(float("nan")) is None
+    and W._finite_positive(True) is None)
+
 print("== data_source / boss_key 白名单 ==")
 chk("auto 收", W.validate_config({"data_source": "auto"})["data_source"] == "auto")
 for k in [k for k, _ in P.SOURCE_CHOICES if k and k != "auto"]:
