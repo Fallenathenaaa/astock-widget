@@ -2,7 +2,7 @@
 
 > 半透明、置顶、可拖动的 Windows 11 桌面小挂件。最多盯 5 只 A 股，实时刷新，带分时走势缩略图，顶部常驻大盘指数，涨跌超阈值自动提醒。
 
-当前版本：**v2.1.4** · 更新于 2026-09-20 · [下载](https://github.com/Fallenathenaaa/astock-widget/releases/tag/v2.1.4)
+当前版本：**v2.1.5** · 更新于 2026-09-20 · [下载](https://github.com/Fallenathenaaa/astock-widget/releases/tag/v2.1.5)
 
 ---
 
@@ -72,7 +72,11 @@
 
 ## 版本特点
 
-### v2.1.4（当前）
+### v2.1.5（当前）
+
+- 🐍 **安装脚本的提示不再写死版本号**：`install.bat` / `start.bat` 里的 "This project needs 3.10 - 3.14" 以前是复制进来的第二份版本表，现在统一问 `tools/check_python.py --range`。改 helper 一处就够，不会出现"helper 说 3.15、提示还在说 3.14"
+
+### v2.1.4
 
 **压力路径下的两个竞态 + 数据语义收尾**
 

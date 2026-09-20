@@ -20,6 +20,27 @@ rem version list into this file -- if it is duplicated here, bumping it to 3.15
 rem later means editing two places and they will drift apart.
 set "HELPER=%~dp0tools\check_python.py"
 set "PYCMD="
+
+rem The supported range also gets quoted in the messages below, so ask the
+rem helper for it -- otherwise "3.10 - 3.14" is just another copy that drifts.
+set "PYFINDER="
+where py >nul 2>&1
+if not errorlevel 1 set "PYFINDER=py"
+if not defined PYFINDER (
+  where python >nul 2>&1
+  if not errorlevel 1 set "PYFINDER=python"
+)
+set "PYMIN="
+set "PYMAX="
+if defined PYFINDER (
+  for /f "tokens=1,2" %%A in ('%PYFINDER% "%HELPER%" --range 2^>nul') do (
+    set "PYMIN=%%A"
+    set "PYMAX=%%B"
+  )
+)
+if not defined PYMIN set "PYMIN=see"
+if not defined PYMAX set "PYMAX=tools\check_python.py --range"
+
 if not exist "%PYEXE%" (
   where py >nul 2>&1
   if not errorlevel 1 (
@@ -42,7 +63,7 @@ if not exist "%PYEXE%" (
 if not exist "%PYEXE%" (
   if not defined PYCMD (
     echo.
-    echo FAILED: no supported Python found. This project needs 3.10 - 3.14.
+    echo FAILED: no supported Python found. This project needs %PYMIN% - %PYMAX%.
     echo Install one first: https://www.python.org/downloads/
     echo If it is installed, make sure "py" or "python" is on your PATH.
     pause
@@ -55,7 +76,7 @@ if not exist "%PYEXE%" (
 if not exist "%PYEXE%" (
   echo.
   echo FAILED: cannot create the virtual environment.
-  echo Install Python 3.10 - 3.14 first: https://www.python.org/downloads/
+  echo Install Python %PYMIN% - %PYMAX% first: https://www.python.org/downloads/
   pause
   exit /b 1
 )
@@ -72,7 +93,7 @@ rem .venv behind their back).
 if errorlevel 1 (
   echo.
   echo FAILED: this .venv uses an unsupported Python version.
-  echo          This project needs Python 3.10 - 3.14.
+  echo          This project needs Python %PYMIN% - %PYMAX%.
   echo.
   echo To fix it (three steps, about one minute):
   echo   1. Close this window.

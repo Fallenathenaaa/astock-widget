@@ -134,6 +134,16 @@ chk("install.bat 不再硬编码版本表",
     "3.14 3.13" not in bat and "3.13 3.12" not in bat and "3.12 3.11" not in bat)
 chk("install.bat 改用 --find 问 helper", "--find" in bat)
 chk("install.bat 指向 check_python.py", "check_python.py" in bat)
+# 错误提示里也不能写死 —— 那是最容易被漏掉的第二种复制方式
+import re
+for name in ("install.bat", "start.bat"):
+    txt = io.open(os.path.join(ROOT, name), encoding="utf-8",
+                  errors="replace").read()
+    hits = [l.strip() for l in txt.splitlines()
+            if re.search(r"^\s*echo\b.*\d+\.\d+", l, re.I)]
+    chk("%s 的用户可见提示里没有写死版本号" % name, not hits, hits[:3])
+    if name == "install.bat":
+        chk("install.bat 用 --range 填提示", "--range" in txt)
 
 print()
 print("%d passed, %d failed" % (ok, fail))

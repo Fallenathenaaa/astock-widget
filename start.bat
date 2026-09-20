@@ -24,11 +24,30 @@ if not exist "%PYEXE%" (
 )
 rem Same version gate as install.bat: an old .venv (3.8/3.9 from early
 rem versions) must not sneak through just because PySide6 happens to import.
+rem The range comes from the helper -- do not hardcode it here.
+set "HELPER=%~dp0tools\check_python.py"
+set "PYFINDER="
+where py >nul 2>&1
+if not errorlevel 1 set "PYFINDER=py"
+if not defined PYFINDER (
+  where python >nul 2>&1
+  if not errorlevel 1 set "PYFINDER=python"
+)
+set "PYMIN="
+set "PYMAX="
+if defined PYFINDER (
+  for /f "tokens=1,2" %%A in ('%PYFINDER% "%HELPER%" --range 2^>nul') do (
+    set "PYMIN=%%A"
+    set "PYMAX=%%B"
+  )
+)
+if not defined PYMIN set "PYMIN=see"
+if not defined PYMAX set "PYMAX=tools\check_python.py --range"
 "%PYEXE%" "%~dp0tools\check_python.py"
 if errorlevel 1 (
   echo.
   echo FAILED: this .venv uses an unsupported Python version.
-  echo          This project needs Python 3.10 - 3.14.
+  echo          This project needs Python %PYMIN% - %PYMAX%.
   echo.
   echo Fix it by running install.bat -- it will tell you exactly what to do.
   pause
