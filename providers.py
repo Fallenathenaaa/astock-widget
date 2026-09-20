@@ -86,7 +86,11 @@ def _opt_num(v):
         f = float(v)
     except (TypeError, ValueError, OverflowError):
         return None
-    return f if math.isfinite(f) else None
+    if not math.isfinite(f):
+        return None
+    # 成交量不可能为负。负值说明这一列是坏数据，不是"零成交" ——
+    # 和缺失 / 畸形 / NaN / ±inf 一样按"没给"处理，不许拿去判停牌。
+    return None if f < 0 else f
 
 
 def _field(f, i):
@@ -170,7 +174,16 @@ def make_quote(full, code, name, price, prev, high=0.0, low=0.0, open_=0.0,
     prev = _num(prev)
     if prev <= 0 or not code or not full:
         return None
-    price = _num(price)
+    # ★ price 读不出来时**整条 quote 作废**，不能当成"价格是 0"。
+    # 当成 0 的话，quote_status() 第一条 `if price <= 0: return HALT` 会把它
+    # 包装成"停牌" —— 而真实情况是"这行数据不可信"。这和 malformed volume
+    # 是同一类问题：读不出来 ≠ 真的是那个值。
+    #
+    # 返回 None 让 ProviderChain 拿去问备源补缺；两源都坏时这一行就是缺失，
+    # 界面上留空，而不是挂一个假的"停牌"。
+    price = _num(price, None)
+    if price is None:
+        return None
     # 全部先转成数字：接口给的是字符串，直接往下传会让
     # quote_status 里的 "volume <= 0" 拿字符串和 int 比，抛 TypeError
     high = _num(high)

@@ -45,7 +45,7 @@ import providers
 from providers import HALT, LIMIT_UP, LIMIT_DN
 
 APP_NAME = "A股桌面盯盘挂件"
-APP_VERSION = "v2.1.3"
+APP_VERSION = "v2.1.4"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "stocks.json")
@@ -1361,7 +1361,6 @@ class Fetcher(QThread):
         # full -> {"ts", "source", "generation", "pts"}
         # 后两个是身份：换源或换自选之后，旧 entry 天然不该再被命中
         self._spark_cache = {}
-        self._spark_tick = 0
         # 这些也会在锁里改，读之前一律先快照
         self.show_index = True
         self.fast = 3
@@ -1375,13 +1374,11 @@ class Fetcher(QThread):
         with self._state_lock:
             self._codes = tuple(codes or ())
             self._generation += 1
-            self._spark_tick = 0
             return self._generation
 
     def set_spark_enabled(self, on):
         with self._state_lock:
             self.spark_enabled = bool(on)
-            self._spark_tick = 0    # 重新打开时立刻拉一次
 
     def set_interval(self, fast):
         """改刷新间隔（秒）。"""
@@ -1402,7 +1399,6 @@ class Fetcher(QThread):
         with self._state_lock:
             self.source = key or "auto"
             self._generation += 1
-            self._spark_tick = 0
             return self._generation
 
     def clear_spark_cache(self):
@@ -1450,11 +1446,10 @@ class Fetcher(QThread):
             if self._stop:
                 return
             if rows or idx:
-                self._fill_spark(rows, spark_enabled, fast, source, generation)
+                self._fill_spark(rows, spark_enabled, source, generation)
                 self.data_ready.emit({"generation": generation,
                                       "rows": rows, "idx": idx})
 
-            self._spark_tick -= 1
             slept = 0.0
             interval = self._next_interval(fast)
             while slept < interval and not self._stop:
@@ -1484,22 +1479,26 @@ class Fetcher(QThread):
             return None
         return hit
 
-    def _fill_spark(self, rows, spark_enabled, fast, source, generation):
-        """分时走势填进 rows。关掉分时就不发请求，缓存没过期也不发。"""
+    def _fill_spark(self, rows, spark_enabled, source, generation):
+        """分时走势填进 rows。关掉分时就不发请求。
+
+        ★ 不要用全局计数决定"这一轮要不要拉分时"。
+        它和每条缓存自己的 (ts, TTL) 是重复的第二套状态，而且会竞态：
+        旧 generation 的 `_fill_spark()` 在循环结束后会把计数重新抬高，
+        于是刚切完源的新一轮读到 "计数 > 0" 就直接返回 —— 价格已经是新源的，
+        分时图却空白着，要等计数倒数归零（交易时段最长接近 5 分钟）。
+
+        `_spark()` 自己会先查缓存：没过期就返回、过期才联网。
+        所以直接每轮逐行调它就行，最多 5 只股票，成本可以忽略。
+        """
         if not spark_enabled:
             for r in rows:
                 r["spark"] = None
-            return
-        if self._spark_tick > 0:
-            for r in rows:
-                hit = self._spark_entry(r.get("full"), source, generation)
-                r["spark"] = (hit or {}).get("pts")
             return
         for r in rows:
             if self._stop:              # 退出时别再一只只地慢慢拉
                 return
             r["spark"] = self._spark(r.get("full"), source, generation)
-        self._spark_tick = max(1, int(self.SPARK_TTL / max(fast, 1)))
 
     def _next_interval(self, fast):
         """连续失败就退避，避免断网时死命重试；恢复成功后自动回到正常频率"""

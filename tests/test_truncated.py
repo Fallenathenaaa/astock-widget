@@ -137,6 +137,12 @@ print("== 畸形成交量也算「没给」，不是 0 ==")
 # 接口偶尔会塞占位符（"--" 真实见过）。那个字段读不出来，跟"成交量是 0"
 # 是两回事 —— 当 0 处理就会判成停牌，把一只正常交易的股票显示成 --。
 market_clock.has_session_started = lambda *a, **k: True
+# 负成交量也是坏数据，不是"零成交"
+for bad in ["-1", "-0.5", "-1e9"]:
+    P.http_get = FakeGet(response(50, volume=bad))
+    q = P.TencentProvider().quotes(["sh600519"])[0]
+    chk("成交量 %r → None（负数无效）" % bad, q["volume"] is None, q["volume"])
+    chk("成交量 %r → 不判停牌" % bad, q["status"] != P.HALT, q["status"])
 for bad in ["abc", "--", "nan", "inf", "-inf", "1e999", "null", "N/A", "None"]:
     P.http_get = FakeGet(response(50, volume=bad))
     q = P.TencentProvider().quotes(["sh600519"])[0]

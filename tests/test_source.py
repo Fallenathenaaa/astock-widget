@@ -90,7 +90,15 @@ chk("普通股报 2 位小数",
     P.make_quote("sh600519", "600519", "某某", 1.0, 1.0)["decimals"] == 2)
 chk("昨收为 0 是废数据", P.make_quote("sh600519", "600519", "某某", 1.0, 0) is None)
 chk("没有 full 也是废数据", P.make_quote("", "600519", "某某", 1.0, 10.0) is None)
-chk("乱字段不炸", P.make_quote("sh600519", "600519", "某某", "abc", "10.0")["price"] == 0.0)
+# 价格读不出来 → 整条作废，不是"价格 0"（后者会被判成停牌）
+chk("价格是乱码 → 整条作废", P.make_quote("sh600519", "600519", "某某", "abc", "10.0") is None)
+chk("价格是占位符 -- → 整条作废",
+    P.make_quote("sh600519", "600519", "某某", "--", "10.0") is None)
+chk("价格是 nan / inf → 整条作废",
+    P.make_quote("sh600519", "600519", "某某", "nan", "10.0") is None
+    and P.make_quote("sh600519", "600519", "某某", "1e999", "10.0") is None)
+chk("明确给了 0 → 保留（可能真是停牌）",
+    P.make_quote("sh600519", "600519", "某某", "0", "10.0") is not None)
 
 print("== 来自网络的数字一律 finite-aware ==")
 # 配置端已经挡住了 ±inf，网络端也得挡：接口给个 1e999 或 400 位数字，
@@ -107,8 +115,61 @@ chk("_opt_num 缺失 → None", P._opt_num("") is None and P._opt_num(None) is N
 for bad in ["abc", "--", "nan", "inf", "-inf", "1e999"]:
     chk("_opt_num(%r) → None（不是 0）" % bad, P._opt_num(bad) is None, P._opt_num(bad))
 chk("_opt_num 超大整数 → None", P._opt_num(10 ** 400) is None)
+for bad in ["-1", "-0.5", -3, "-1e9"]:
+    chk("_opt_num(%r) → None（负成交量是坏数据）" % (bad,),
+        P._opt_num(bad) is None, P._opt_num(bad))
 chk("_opt_num 真实的 0 仍然是 0.0", P._opt_num("0") == 0.0)
 chk("_opt_num 正常值照常", P._opt_num("123456") == 123456.0)
+
+print("== 价格读不出来 → 整条丢弃，让备源补 ==")
+
+
+class BadPrice(P.Provider):
+    """主源：价格字段是个占位符（真实接口偶尔给 "--"）。"""
+
+    key = "bad"
+
+    def __init__(self, price="--"):
+        self._price = price
+
+    def quotes(self, codes):
+        out = []
+        for c in codes:
+            q = P.make_quote(c, c[2:], "坏价格", self._price, "10.0", volume=100)
+            if q:
+                out.append(q)
+        return out
+
+
+class GoodPrice(P.Provider):
+    """备源：价格正常。"""
+
+    key = "good"
+
+    def quotes(self, codes):
+        return [P.make_quote(c, c[2:], "好价格", "11.0", "10.0", volume=100,
+                             provider="good") for c in codes]
+
+
+_old_chain = P._QUOTE_CHAIN
+try:
+    P._QUOTE_CHAIN = P.ProviderChain([BadPrice(), GoodPrice()])
+    out = P.fetch_quotes(["sh600519"])
+    chk("主源价格坏了 → 这行由备源补上",
+        [o.get("full") for o in out] == ["sh600519"], out)
+    chk("补上来的是备源的数据", out and out[0]["price"] == 11.0,
+        out[0] if out else None)
+    chk("补上来的标着备源（界面会显示灰色小字）",
+        out and out[0].get("provider") == "good", out[0] if out else None)
+    chk("不是被包装成停牌", out and out[0].get("status") != P.HALT,
+        out[0] if out else None)
+
+    # 两源都坏 → 这一行就是缺失，不该显示成"停牌"
+    P._QUOTE_CHAIN = P.ProviderChain([BadPrice("--"), BadPrice("abc")])
+    out = P.fetch_quotes(["sh600519"])
+    chk("两源价格都坏 → 该行缺失", out == [], out)
+finally:
+    P._QUOTE_CHAIN = _old_chain
 
 print("== 来源标记 / 涨跌停价是不是推算的 ==")
 # 一屏里可能混着两个源的数据（主源漏一只、备源补上），出偏差要能问出

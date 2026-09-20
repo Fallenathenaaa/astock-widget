@@ -410,6 +410,62 @@ finally:
     W.providers.fetch_spark = _real_spark
     f2._stop = True
 
+print("== 切源 / 换自选后，当轮就要拉新身份的分时 ==")
+# 二阶竞态：旧 generation 的 _fill_spark() 在循环结束后会把全局计数值重新抬高，
+# 于是刚切完源的新一轮读到"计数 > 0"就直接返回 —— 价格已经是新源的了，
+# 分时图却空白着，要等计数倒数归零（交易时段最长接近 5 分钟）。
+# 所以不要留第二套 TTL 状态，让每条 cache entry 自己决定过没过期。
+
+
+def race_fill(bump, label, src_old, src_new):
+    """bump: 让身份变化的那个动作（set_source / set_codes）。"""
+    fx = W.Fetcher()
+    fx.set_codes(["sh600519"])
+    g_old = fx._generation
+    seen = []
+
+    def fake(full, prefer="auto"):
+        seen.append((full, prefer))
+        if len(seen) == 1:              # 旧身份的第一通请求卡住
+            go.set()
+            done.wait(5)
+        return [10.0, 10.2] if prefer == "tencent" else [20.0, 20.5]
+
+    go, done = threading.Event(), threading.Event()
+    W.providers.fetch_spark = fake
+    old_rows = [{"full": "sh600519"}]
+    t = threading.Thread(
+        target=lambda: fx._fill_spark(old_rows, True, src_old, g_old))
+    t.start()
+    try:
+        if not go.wait(5):
+            chk("%s：旧 _fill_spark 卡进网络" % label, False, "没等到")
+            return
+        g_new = bump(fx)                # 身份变化（切源 / 换自选）
+        fx.clear_spark_cache()
+        done.set()
+        t.join(5)
+
+        # 新身份的**当轮**就必须真的去拉，不能返回全 None
+        seen.clear()
+        new_rows = [{"full": "sh600519"}]
+        fx._fill_spark(new_rows, True, src_new, g_new)
+        chk("%s：当轮就发新身份的 spark 请求" % label, seen != [], seen)
+        chk("%s：当轮就拿到分时，不是 None" % label,
+            new_rows[0].get("spark") is not None, new_rows[0].get("spark"))
+        chk("%s：拿到的是新身份的走势" % label,
+            new_rows[0].get("spark") == [20.0, 20.5] or src_new == "tencent",
+            new_rows[0].get("spark"))
+    finally:
+        done.set()
+        t.join(5)
+        fx._stop = True
+        W.providers.fetch_spark = _real_spark
+
+
+race_fill(lambda fx: fx.set_source("sina"), "切源", "tencent", "sina")
+race_fill(lambda fx: fx.set_codes(["sh600519"]), "换自选", "auto", "auto")
+
 print()
 print("%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

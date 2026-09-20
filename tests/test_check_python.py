@@ -9,6 +9,7 @@ install 绿灯、start 只查 import PySide6（旧环境装着就过），README
 版本判断放在 tools/check_python.py 里，就是为了能在 CI 上真的测一遍
 边界，而不是靠肉眼看 .bat。
 """
+import io
 import os
 import subprocess
 import sys
@@ -95,6 +96,44 @@ print("== main() 可直接被塞 argv ==")
 chk("main([]) 当前解释器 → 0", CP.main([]) == 0)
 chk("main([不存在的目录]) → 1",
     CP.main([os.path.join(tempfile.gettempdir(), "no-such-venv-xyz")]) == 1)
+
+print("== --range / --find：让 .bat 不再复制版本表 ==")
+HELPER = os.path.join(ROOT, "tools", "check_python.py")
+
+r = subprocess.run([PY, HELPER, "--range"], capture_output=True,
+                   encoding="utf-8", errors="replace")
+chk("--range 退出码 0", r.returncode == 0, r.returncode)
+chk("--range 输出就是 MIN/MAX 那一对",
+    (r.stdout or "").strip() == "3.10 3.14", (r.stdout or "").strip())
+chk("--range 和常量一致",
+    (r.stdout or "").split() == ["%d.%d" % CP.MIN_PY, "%d.%d" % CP.MAX_PY])
+
+r = subprocess.run([PY, HELPER, "--find"], capture_output=True,
+                   encoding="utf-8", errors="replace")
+chk("--find 退出码 0（CI 上三个版本都在区间内）", r.returncode == 0,
+    (r.returncode, (r.stdout or "") + (r.stderr or "")))
+found = (r.stdout or "").strip()
+chk("--find 输出非空", bool(found), found)
+if found:
+    # 输出必须能直接拼 -m venv 用 —— 这就是 bat 接下来要做的事
+    v = CP.probe(found.split())
+    chk("--find 出来的解释器版本受支持", v is not None and CP.version_ok(v),
+        (found, v))
+
+cmd, ver = CP.find_interpreter()
+chk("find_interpreter() 也能找到", cmd is not None and ver is not None, (cmd, ver))
+if cmd:
+    chk("find_interpreter() 返回的版本受支持", CP.version_ok(ver), ver)
+
+print("== 版本表不能被复制到别处 ==")
+# 如果 install.bat 里又出现一份 `3.14 3.13 3.12 ...`，那"唯一真相源"就是假的：
+# 以后升到 3.15 要改两个地方，而且一定会漂。
+bat = io.open(os.path.join(ROOT, "install.bat"), encoding="utf-8",
+              errors="replace").read()
+chk("install.bat 不再硬编码版本表",
+    "3.14 3.13" not in bat and "3.13 3.12" not in bat and "3.12 3.11" not in bat)
+chk("install.bat 改用 --find 问 helper", "--find" in bat)
+chk("install.bat 指向 check_python.py", "check_python.py" in bat)
 
 print()
 print("%d passed, %d failed" % (ok, fail))

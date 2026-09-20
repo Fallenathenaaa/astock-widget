@@ -46,12 +46,17 @@ class FakeAPI:
     """按路径返回假响应的 http()。顺手记下每一次调用。"""
 
     def __init__(self, tag_sha=None, release=True, runs=None, jobs=None,
-                 ref_status=200, head_seq=None):
+                 ref_status=200, head_seq=None, after_post_tag=None):
         self.tag_sha = tag_sha          # None = 404 不存在
         self.release = release
         self.runs = runs if runs is not None else []
         self.jobs = jobs if jobs is not None else []
         self.ref_status = ref_status
+        # 建完 tag 之后 GET tag 的行为（模拟"写进去了但读不回来"）：
+        #   None  = 正常，返回刚写进去的 sha
+        #   "404" = 一直 404    "500" = 服务器错误
+        self.after_post_tag = after_post_tag
+        self._posted_tag_sha = None
         # 每次查 main 依次返回这里的 sha（用来模拟"发版期间 main 变了"）；
         # 用完了就一直给最后一个
         self.head_seq = list(head_seq) if head_seq else None
@@ -67,6 +72,12 @@ class FakeAPI:
                 sha = HEAD
             return 200, {"object": {"sha": sha}}
         if method == "GET" and "/git/refs/tags/" in path:
+            if self._posted_tag_sha is not None:
+                if self.after_post_tag == "404":
+                    return 404, {"message": "Not Found"}
+                if self.after_post_tag == "500":
+                    return 500, {"message": "boom"}
+                return 200, {"object": {"sha": self._posted_tag_sha}}
             if self.tag_sha is None:
                 return 404, {"message": "Not Found"}
             if self.ref_status != 200:
@@ -79,6 +90,7 @@ class FakeAPI:
         if method == "GET" and "/jobs?" in path:
             return 200, {"jobs": self.jobs}
         if method == "POST" and path.endswith("/git/refs"):
+            self._posted_tag_sha = (body or {}).get("sha", "")
             return 201, {"ref": body["ref"]}
         if method == "POST" and path.endswith("/releases"):
             return 201, {"draft": False, "tag_name": body["tag_name"],
@@ -233,6 +245,26 @@ api = FakeAPI(tag_sha=HEAD, release=False, head_seq=[HEAD, OTHER])
 rc, msg = run_main(["--no-preflight"], api)
 chk("补建 Release 前也核 main", rc == 1 and "main 已经变了" in msg, msg)
 chk("核不过就不建 Release", not posted(api, "release"), api.calls)
+
+print("== 建完 tag 后的验证必须是 fail-closed ==")
+# 只拦"读到了错误的 sha"是不够的：重试后仍 404、或者 HTTP 500 查不清，
+# 这两种反而会放行 —— 等于验证了个寂寞。发布工具应该是查不清就停。
+api = FakeAPI(tag_sha=None, release=False, after_post_tag="404")
+rc, msg = run_main(["--no-preflight"], api)
+chk("建完 tag 仍查不到 → 拒绝", rc == 1 and "仍然查不到" in msg, msg)
+chk("拒绝时不建 Release", not posted(api, "release"), api.calls)
+chk("tag 确实建了（所以才需要这一步验证）", len(posted(api, "tag")) == 1, api.calls)
+
+api = FakeAPI(tag_sha=None, release=False, after_post_tag="500")
+rc, msg = run_main(["--no-preflight"], api)
+chk("建完 tag 状态查不清 → 拒绝", rc == 1 and "查不清" in msg, msg)
+chk("查不清时不建 Release", not posted(api, "release"), api.calls)
+
+# 正常路径：POST 之后能读回同一个 sha → 放行
+api = FakeAPI(tag_sha=None, release=False)
+rc, msg = run_main(["--no-preflight"], api)
+chk("读回同一个 sha → 正常建 Release", rc == 0, msg)
+chk("正常路径 Release 建了", len(posted(api, "release")) == 1, api.calls)
 
 print("== 发版前查 tag 不该白等 15 秒 ==")
 # eventual consistency 只适用于"我们刚 POST 完"。还没写任何东西时的 404

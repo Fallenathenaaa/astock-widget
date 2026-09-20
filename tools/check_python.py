@@ -57,11 +57,16 @@ def resolve(target):
     return target
 
 
-def probe(exe):
-    """问一个解释器它自己是什么版本。问不出来返回 None。"""
+def probe(cmd):
+    """问一个解释器它自己是什么版本。问不出来返回 None。
+
+    cmd 可以是字符串，也可以是 ["py", "-3.13"] 这种列表。
+    """
+    args = [cmd] if isinstance(cmd, str) else list(cmd)
     try:
         out = subprocess.run(
-            [exe, "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"],
+            args + ["-c",
+                    "import sys; print('%d.%d.%d' % sys.version_info[:3])"],
             capture_output=True, encoding="utf-8", errors="replace", timeout=30)
     except Exception:
         return None
@@ -76,8 +81,49 @@ def probe(exe):
         return None
 
 
+def find_interpreter():
+    """在本机找第一个受支持的 Python。
+
+    返回 (命令列表, 版本元组)；命令列表可以直接拼 `-m venv` 用。
+    先试 py launcher（从 3.14 往 3.10），再试 python3 / python。
+    找不到返回 (None, None)。
+
+    ★ 让 .bat 用这个而不是自己抄一份版本表 —— 否则"唯一真相源"就是假的：
+    helper 改了 3.15，install.bat 的 `for %%V in (3.14 3.13 ...)` 还在原地。
+    """
+    import shutil
+    candidates = []
+    py = shutil.which("py")
+    if py:
+        for minor in range(MAX_PY[1], MIN_PY[1] - 1, -1):
+            candidates.append([py, "-%d.%d" % (MIN_PY[0], minor)])
+    for name in ("python3", "python"):
+        p = shutil.which(name)
+        if p:
+            candidates.append([p])
+    for cmd in candidates:
+        ver = probe(cmd)
+        if ver and version_ok(ver):
+            return cmd, ver
+    return None, None
+
+
 def main(argv=None):
     argv = list(sys.argv[1:]) if argv is None else list(argv)
+
+    if "--range" in argv:
+        print("%d.%d %d.%d" % (MIN_PY + MAX_PY))
+        return 0
+
+    if "--find" in argv:
+        cmd, ver = find_interpreter()
+        if not cmd:
+            print("找不到受支持的 Python（需要 %d.%d - %d.%d）"
+                  % (MIN_PY + MAX_PY), file=sys.stderr)
+            return 1
+        print(" ".join(cmd))
+        return 0
+
     target = argv[0] if argv else None
 
     if target is None:

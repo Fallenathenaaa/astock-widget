@@ -12,22 +12,30 @@ set "PYEXE=%VENV%\Scripts\python.exe"
 set "PYCMD="
 
 rem ---- pick an interpreter whose version this project actually supports ----
-rem requirements.txt says Python 3.10 - 3.14. Building the venv with 3.9 or
-rem 3.15 would "succeed" and then fail much later inside pip with a message
-rem that has nothing to do with the real cause.
+rem Building the venv with 3.9 or 3.15 would "succeed" and then fail much later
+rem inside pip with a message that has nothing to do with the real cause.
+rem
+rem The supported range lives in tools\check_python.py only. Do NOT copy the
+rem version list into this file -- if it is duplicated here, bumping it to 3.15
+rem later means editing two places and they will drift apart.
+set "HELPER=%~dp0tools\check_python.py"
+set "PYCMD="
 if not exist "%PYEXE%" (
   where py >nul 2>&1
   if not errorlevel 1 (
-    for %%V in (3.14 3.13 3.12 3.11 3.10) do (
-      if not defined PYCMD (
-        py -%%V -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)" >nul 2>&1
-        if not errorlevel 1 set "PYCMD=py -%%V"
-      )
+    for /f "delims=" %%P in ('py "%HELPER%" --find 2^>nul') do set "PYCMD=%%P"
+  )
+  if not defined PYCMD (
+    where python >nul 2>&1
+    if not errorlevel 1 (
+      for /f "delims=" %%P in ('python "%HELPER%" --find 2^>nul') do set "PYCMD=%%P"
     )
   )
   if not defined PYCMD (
-    python -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] <= (3, 14) else 1)" >nul 2>&1
-    if not errorlevel 1 set "PYCMD=python"
+    where python3 >nul 2>&1
+    if not errorlevel 1 (
+      for /f "delims=" %%P in ('python3 "%HELPER%" --find 2^>nul') do set "PYCMD=%%P"
+    )
   )
 )
 

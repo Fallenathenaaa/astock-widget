@@ -243,7 +243,17 @@ def main(argv=None):
                      % out.get("message"))
         # tag 建完之后才需要容忍 eventual consistency：刚写的 ref 可能还查不到
         wrote = tag_sha(tag, token, retry_on_404=True)
-        if wrote and wrote != sha:
+        # ★ fail-closed：只拦"读到了错误的 sha"是不够的 —— 完全读不到
+        # （重试后仍 404，或 HTTP 500 查不清）反而放行，等于验证了个寂寞。
+        # 发布工具一贯的原则是查不清就停，不是查不清就走。
+        if wrote is None:
+            sys.exit("tag 建完了但状态查不清（不是 404）—— 停下，别再建 Release。\n"
+                     "去网页上确认 %s 的情况；如果 tag 已经建好，重跑这个脚本"
+                     "会只补建 Release。" % tag)
+        if not wrote:
+            sys.exit("tag 建完了却仍然查不到（重试后还是 404）—— 停下，"
+                     "别再建 Release。\n去网页上确认 %s 的情况。" % tag)
+        if wrote != sha:
             sys.exit("刚建好的 tag 指向 %s，不是我们想要的 %s —— 停下，"
                      "别再往下建 Release。" % (wrote, sha))
 
