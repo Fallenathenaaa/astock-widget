@@ -5,6 +5,7 @@ A股桌面盯盘挂件 (Windows 11)
 - 最多 5 只股票，红涨绿跌，含分时迷你走势
 - 数据源：腾讯 / 新浪行情接口（免费、无需 Key），主源挂了自动切备源
 """
+import atexit
 import io
 import glob
 import json
@@ -45,7 +46,7 @@ import providers
 from providers import HALT, LIMIT_UP, LIMIT_DN
 
 APP_NAME = "A股桌面盯盘挂件"
-APP_VERSION = "v2.1.5"
+APP_VERSION = "v2.1.6"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "stocks.json")
@@ -554,6 +555,47 @@ FOOTER_H = 18
 EFFECT_SECONDS = 180   # 收盘彩蛋持续时间：3 分钟（触发窗口见 market_clock.CLOSING_CALL）
 ALERT_REARM_GAP = 0.3  # 异动提醒：回落到 (阈值 - 0.3)% 以下才重新武装，防边界抖动反复弹
 
+# 提醒最多认这么多秒以前的行情。超过就不当"实时异动"弹 —— 否则 provider
+# 返回昨天收盘的数据时，用户会在盘中收到一条假的实时提醒（P1）。
+ALERT_MAX_AGE_SEC = 120
+
+# 自选股上限。以前这个 5 散落在四处，改一处漏一处。
+MAX_WATCHLIST = 5
+
+# 占位行的标记：某只股票两个源都没给数据时，界面保留这一格而不是缩窗口。
+# 带这个标记的 row 不参与提醒 / 彩蛋 / 盈亏 / 分时（P1）。
+ROW_UNAVAILABLE = "unavailable"
+
+
+def unavailable_row(full):
+    """两个源都拿不到这只的数据时的占位行。
+
+    为什么要有它：以前 `self.rows = 接口返回的行`，某只缺失时窗口直接从
+    5 行缩成 4 行 —— 用户分不清是自己删了、还是行情源没数据、还是代码错了。
+    盯盘时这是个很糟的失败模式。现在缺哪只就把哪只留成占位格，显示 `--`
+    和"数据暂不可用"，窗口不跳。
+    """
+    return {
+        "full": full,
+        "code": full[2:] if len(full) > 6 else full,
+        "name": "暂无数据",
+        "decimals": 2,
+        "price": 0.0,
+        "prev": 0.0,
+        "change": 0.0,
+        "pct": 0.0,
+        "high": 0.0,
+        "low": 0.0,
+        "open": 0.0,
+        "volume": None,
+        "time": "",
+        "status": HALT,               # 让绘制走"没有价格"那套
+        "provider": "",
+        "limit_estimated": True,
+        ROW_UNAVAILABLE: True,
+        "spark": None,
+    }
+
 IDLE_TICK_MS = 500     # 平时心跳：2fps，只用来倒计时 pulse / 清理过期状态
 ANIM_TICK_MS = 50      # 有动画时的心跳：20fps（飘落物 / 火焰 / 冰霜）
 SEARCH_DEBOUNCE_MS = 300   # 搜索防抖：停手 300ms 才发请求，别一个字一次
@@ -616,7 +658,8 @@ DEFAULT_CONFIG = {
     "spark": True,
     "click_through": False,
     "always_on_top": True,
-    "autostart": False,
+    # 注意：没有 "autostart" —— Windows 注册表才是开机自启的唯一真相源，
+    # 存一份在配置里迟早会和真实状态不一致（见 get_autostart / set_autostart）
     # 注意：节日「强制开启」是 runtime-only（self._forced_festival），**不进配置**。
     # 存过一次就可能在崩溃后残留，与"严格按日期触发"冲突。
     "unlocked": False,          # 隐藏菜单是否已解锁（输对一次口令后记住，免得每次重启重输）
@@ -810,7 +853,7 @@ def validate_config(raw):
                 out[key] = _validated_str(key, v)
             elif isinstance(default, list):
                 # 只收字符串：str(x) 会把 None 变成字面量 "None"，那是纯垃圾
-                out[key] = ([x for x in v if isinstance(x, str)][:5]
+                out[key] = ([x for x in v if isinstance(x, str)][:MAX_WATCHLIST]
                             if isinstance(v, (list, tuple)) else list(default))
             elif isinstance(default, dict):
                 if key == "positions":
@@ -1098,6 +1141,79 @@ def write_crash_log(text):
         return None
 
 
+RUN_PREFIX = "run-"
+RUN_KEEP = 14               # 运行日志按天留，两周够回头翻了
+RUN_SLOW_SEC = 5.0          # 一轮取数超过这么多秒就记一笔（正常 1 秒上下）
+HEARTBEAT_SEC = 300         # 每 5 分钟一行"还活着"
+
+
+def _log_alive(cycles, outages):
+    """心跳。
+
+    ★ 为什么要有它：挂件出现过"自己没了"的情况 —— 没有 STOP、没有崩溃日志、
+    Windows 也没记录崩溃，说明进程是**被外部强制结束**的（Python 连一行代码
+    都来不及执行，atexit 也不会跑）。那种情况下日志会停在某条 ALIVE 之后，
+    于是"它活到几点"就精确可查了。
+
+    心跳写在行情线程里，不依赖 Qt 主线程 —— 所以还能顺带区分：
+    主线程卡死时 ALIVE 照样在写，整个进程被杀时 ALIVE 才停。
+    """
+    write_run_log("ALIVE    共 %d 轮，断联 %d 次" % (cycles, outages))
+
+
+_boot_time = None       # 启动时刻，给退出钩子算"跑了多久"
+
+
+def _log_exit():
+    """退出钩子：只要 Python 是"自己走完"的（sys.exit / 正常结束），atexit
+    就会执行，日志里就会有一行 EXIT。
+
+    如果进程是被外部 TerminateProcess 杀掉的，atexit **不会**执行 —— 于是
+    日志停在最后一条 ALIVE 上，既没有 EXIT 也没有 STOP。两种情况不再混淆。
+    """
+    mins = ((time.time() - _boot_time) / 60.0) if _boot_time else 0.0
+    write_run_log("EXIT     Python 进程退出（%.1f 分钟）" % mins)
+
+
+def _run_log_path():
+    """运行日志按天一个文件：logs/run-YYYYMMDD.log。"""
+    return os.path.join(LOG_DIR,
+                        RUN_PREFIX + datetime.now().strftime("%Y%m%d") + ".log")
+
+
+def _rotate_run_logs():
+    try:
+        files = sorted(glob.glob(os.path.join(LOG_DIR, RUN_PREFIX + "*.log")),
+                       reverse=True)
+        for old in files[RUN_KEEP:]:
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def write_run_log(line):
+    """往当天的运行日志追加一行。
+
+    ★ 为什么要有它：以前只有崩溃日志，"跑了一天稳不稳 / 断没断联 / 断了多久"
+    全查不出来 —— 只能靠用户肉眼看「更新」时间有没有跳。
+
+    刻意只记**异常和边界**（起停 / 断联 / 恢复 / 慢轮次），不记每一轮成功，
+    否则一天几千行反而没人看。
+    """
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%H:%M:%S")
+        with io.open(_run_log_path(), "a", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (stamp, line))
+        _rotate_run_logs()
+        return True
+    except Exception:
+        return False
+
+
 def _crash_text(exc_type, exc, tb):
     head = ["%s %s" % (APP_NAME, APP_VERSION),
             "Python %s" % sys.version.split()[0],
@@ -1343,13 +1459,12 @@ class Fetcher(QThread):
     """
     data_ready = Signal(dict)
     failed = Signal(str)
-
-    # 退出时要等得起"一次完整的在途调用"。单个源超时 5 秒，自动降级最坏要把
-    # 两个源都试一遍（5+5=10 秒）—— 6500 是只有一个源的时候定的，留不住了。
+    # 顶层异常：只写日志的话线程会静默死掉，用户看到的是"挂件还在但行情不动"。
+    # 必须让 UI 知道（P1）。
+    fatal = Signal(str)
     # 按源的数量算，以后再加第三个源也不会忘了改。
     WORKER_WAIT_MS = (providers.HTTP_TIMEOUT * 1000 * len(providers.PROVIDERS)
                       + 2000)      # 余量：解析 + 建连接的开销
-    SPARK_TTL = 300     # 分时缓存的有效期（秒）
 
     def __init__(self):
         super().__init__()
@@ -1358,17 +1473,45 @@ class Fetcher(QThread):
         self._generation = 0
         self._stop = False
         self._fail_count = 0
-        # full -> {"ts", "source", "generation", "pts"}
-        # 后两个是身份：换源或换自选之后，旧 entry 天然不该再被命中
-        self._spark_cache = {}
+        # 分时已经搬到 SparkFetcher（独立线程），这里一行都不留
         # 这些也会在锁里改，读之前一律先快照
         self.show_index = True
         self.fast = 3
         self.slow = 60
         self.source = "auto"        # 数据源偏好："auto" / "tencent" / "sina"
-        self.spark_enabled = True   # 关掉分时后后台就不再拉分时
 
-    # ---- 外部只通过这两个方法改状态 ----
+        # ---- 断联观测（只在运行日志里留痕，不影响取数逻辑）----
+        self._outage_since = None   # 断联开始的时刻；None = 当前正常
+        self._outage_times = 0      # 断过几次
+        self._outage_secs = 0.0     # 累计断联时长
+        self._cycles = 0            # 完成了多少轮
+        self._last_beat = time.time()   # 上次写心跳的时刻
+
+    def _mark_ok(self):
+        """这一轮拿到了数据 —— 如果之前是断着的，记一次"恢复"。"""
+        if self._outage_since is None:
+            return
+        secs = time.time() - self._outage_since
+        self._outage_secs += secs
+        write_run_log("RECOVER  断联 %.1f 秒后恢复" % secs)
+        self._outage_since = None
+
+    def _mark_fail(self, why):
+        """这一轮没拿到数据 —— 第一次失败就算断联开始（后续失败不重复记）。"""
+        if self._outage_since is None:
+            self._outage_times += 1
+            self._outage_since = time.time()
+            write_run_log("OUTAGE   取数失败：%s" % why)
+
+    def health_summary(self):
+        """给退出日志用的一行健康小结。"""
+        outage = self._outage_secs
+        if self._outage_since is not None:      # 退出时还断着，把这段也算进去
+            outage += time.time() - self._outage_since
+        return ("共 %d 轮，断联 %d 次，累计 %.1f 秒"
+                % (self._cycles, self._outage_times, outage))
+
+    # ---- 外部只通过 setter 改状态 ----
     def set_codes(self, codes):
         """换自选股。每换一次 generation +1，让在途的旧行情作废。"""
         with self._state_lock:
@@ -1376,9 +1519,6 @@ class Fetcher(QThread):
             self._generation += 1
             return self._generation
 
-    def set_spark_enabled(self, on):
-        with self._state_lock:
-            self.spark_enabled = bool(on)
 
     def set_interval(self, fast):
         """改刷新间隔（秒）。"""
@@ -1401,104 +1541,90 @@ class Fetcher(QThread):
             self._generation += 1
             return self._generation
 
-    def clear_spark_cache(self):
-        """换源后老的分时走势不该再留着（不同源画出来的形状不一样）。"""
-        with self._state_lock:
-            self._spark_cache.clear()
-
     def stop(self):
         self._stop = True
         self.wait(self.WORKER_WAIT_MS)
 
     def run(self):
-        """QThread 里冒出去的异常不一定走 sys.excepthook，自己兜一层落盘。"""
+        """QThread 里冒出去的异常不一定走 sys.excepthook，自己兜一层落盘。
+
+        光落盘是不够的：线程一死，GUI 还活着，用户只会看到"挂件在、价格不动"，
+        比整个进程崩掉更难诊断。所以要 emit fatal 让 UI 明说（P1）。
+        """
         try:
             self._loop()
         except Exception:
             write_crash_log(_crash_text(*sys.exc_info()))
+            self.fatal.emit("行情线程异常停止")
 
     def _loop(self):
         while not self._stop:
+            t_start = time.time()
             with self._state_lock:
                 codes = list(self._codes)
                 generation = self._generation
                 show_index = self.show_index
                 fast = self.fast
                 source = self.source
-                spark_enabled = self.spark_enabled
 
-            rows = []
-            if codes:
-                rows = self._fetch_rows(codes, source)
-            # 每做完一次网络调用就看一眼：这一轮最长能把两个源的超时都走完（10 秒），
-            # 退出时不该等它把指数、分时也一并拉完才返回。
-            if self._stop:
-                return
-
-            # 指数和自选股分开请求：自选删空了，大盘照样要刷新
-            idx = []
-            if show_index:
+            # 自选股 + 大盘指数合成**一次**请求：每轮从 2 组 HTTP 降到 1 组，
+            # 少一个故障点，source / fallback 行为也一致。
+            # 自选删空了照样只请求指数；show_index 关掉就不带指数。
+            want = list(dict.fromkeys(codes + (INDEX_CODES if show_index else [])))
+            got, err = [], ""
+            if want:
                 try:
-                    idx = providers.fetch_quotes(INDEX_CODES, prefer=source)
-                except Exception:
-                    idx = []
+                    got = providers.fetch_quotes(want, prefer=source)
+                except Exception as e:
+                    got, err = [], str(e)
 
+            # 每做完一次网络调用就看一眼：这一轮最长能把两个源的超时都走完（10 秒），
+            # 退出时不该等它把指数也一并拉完才返回。
             if self._stop:
                 return
-            if rows or idx:
-                self._fill_spark(rows, spark_enabled, source, generation)
-                self.data_ready.emit({"generation": generation,
-                                      "rows": rows, "idx": idx})
+
+            if want:
+                t_cycle = time.time() - t_start
+                self._cycles += 1
+                if err or not got:
+                    self._fail_count += 1
+                    self.failed.emit(err or "未取到行情")
+                    err = err or "未取到行情"
+                    self._mark_fail(err)
+                else:
+                    self._fail_count = 0
+                    self._mark_ok()
+                # 慢轮次单独记一笔：正常一轮 1 秒上下，慢了说明接口/网络有问题
+                if t_cycle > RUN_SLOW_SEC:
+                    write_run_log("SLOW     本轮取数 %.1f 秒（源=%s，%d 只）"
+                                  % (t_cycle, source, len(want)))
+
+            by_full = {r.get("full"): r for r in got}
+            rows = [by_full[c] for c in codes if c in by_full]
+            idx = ([by_full[c] for c in INDEX_CODES if c in by_full]
+                   if show_index else [])
+
+            if want:
+                self.data_ready.emit({
+                    "generation": generation,
+                    "rows": rows,
+                    # 核心报价到底成没成 —— 不能由"这一批里至少有一种数据"来决定，
+                    # 否则指数成功会把"股票行情失败"这个错误状态擦掉（P1）。
+                    "rows_ok": bool(rows) or not codes,
+                    "rows_error": "" if rows else err,
+                    "idx": idx,
+                    "idx_ok": bool(idx) or not show_index,
+                })
+
+            if time.time() - self._last_beat >= HEARTBEAT_SEC:
+                self._last_beat = time.time()
+                _log_alive(self._cycles, self._outage_times)
 
             slept = 0.0
             interval = self._next_interval(fast)
             while slept < interval and not self._stop:
                 time.sleep(0.25)
                 slept += 0.25
-
-    def _fetch_rows(self, codes, source):
-        try:
-            rows = providers.fetch_quotes(codes, prefer=source)
-        except Exception as e:
-            self._fail_count += 1
-            self.failed.emit(str(e))
-            return []
-        if not rows:
-            self._fail_count += 1
-            self.failed.emit("未取到行情")
-            return []
-        self._fail_count = 0
-        return rows
-
-    def _spark_entry(self, full, source, generation):
-        """同一身份（**同一个源 + 同一代**）的缓存条目，不看过期。"""
-        hit = self._spark_cache.get(full)
-        if not hit:
-            return None
-        if hit.get("source") != source or hit.get("generation") != generation:
-            return None
-        return hit
-
-    def _fill_spark(self, rows, spark_enabled, source, generation):
-        """分时走势填进 rows。关掉分时就不发请求。
-
-        ★ 不要用全局计数决定"这一轮要不要拉分时"。
-        它和每条缓存自己的 (ts, TTL) 是重复的第二套状态，而且会竞态：
-        旧 generation 的 `_fill_spark()` 在循环结束后会把计数重新抬高，
-        于是刚切完源的新一轮读到 "计数 > 0" 就直接返回 —— 价格已经是新源的，
-        分时图却空白着，要等计数倒数归零（交易时段最长接近 5 分钟）。
-
-        `_spark()` 自己会先查缓存：没过期就返回、过期才联网。
-        所以直接每轮逐行调它就行，最多 5 只股票，成本可以忽略。
-        """
-        if not spark_enabled:
-            for r in rows:
-                r["spark"] = None
-            return
-        for r in rows:
-            if self._stop:              # 退出时别再一只只地慢慢拉
-                return
-            r["spark"] = self._spark(r.get("full"), source, generation)
 
     def _next_interval(self, fast):
         """连续失败就退避，避免断网时死命重试；恢复成功后自动回到正常频率"""
@@ -1507,41 +1633,188 @@ class Fetcher(QThread):
             interval = max(interval, 30)
         return interval
 
+class SparkFetcher(QThread):
+    """分时走势的独立线程 —— 报价刷新的关键路径上绝不能有它。
+
+    ★ 为什么必须独立出去（P0）：
+    以前 spark 是在 `Fetcher._loop()` 里、**`data_ready.emit()` 之前**逐只拉的：
+
+        quote -> index -> fill spark -> emit
+
+    单 provider 超时 5 秒、两源 fallback 最坏 10 秒，5 只就是 50 秒，
+    再叠加指数请求 —— **核心报价最长接近 60 秒不刷新**。
+
+    更糟的是失败没有 negative cache：TTL 一过就每轮逐只重试，所以不是
+    "偶尔卡一次"，而是能**持续**把 3 秒刷新拖成几十秒。
+
+    一个装饰性的小走势图让实时价格失去实时性，这是 P0 级 liveness 故障。
+
+    现在：quote worker 拉到价格就 emit；spark 什么时候回来什么时候 patch
+    那一行。两边互不等待。
+    """
+    # (generation, full, points)
+    spark_ready = Signal(int, str, object)
+    fatal = Signal(str)
+
+    SPARK_TTL = 300         # 缓存有效期（秒）
+    FAIL_BACKOFF = 45       # 某只两源都失败后，多久不再重试（秒）
+
+    # 退出等待：停在一只分时的最坏情况上就行（每只之前都会看一眼 _stop，
+    # 所以不会继续往下走）—— 不必按 5 只算，那会让退出白白等 50 秒。
+    WORKER_WAIT_MS = (providers.HTTP_TIMEOUT * 1000 * len(providers.PROVIDERS)
+                      + 2000)
+
+    def __init__(self):
+        super().__init__()
+        self._state_lock = threading.Lock()
+        self._stop = False
+        self._wake = threading.Event()
+        self._codes = ()
+        self._generation = 0
+        self._source = "auto"
+        self._enabled = True
+        self._spark_cache = {}      # full -> {"ts","source","generation","pts"}
+        self._failed = {}           # full -> 上次失败的时刻
+
+    # ---- 外部只通过 setter 改状态 ----
+    # 注意：generation **不由这里生成** —— 它必须和 Fetcher / Ticker 的
+    # watchlist_generation 是同一个，所以由调用方传进来。这里只负责
+    # "身份一变就把旧缓存清掉"，让 bump 和失效变成一个原子操作（P2-8）。
+    def set_codes(self, codes, generation=None):
+        with self._state_lock:
+            self._codes = tuple(codes or ())
+            if generation is not None:
+                self._generation = generation
+            self._spark_cache.clear()
+            self._failed.clear()
+            return self._generation
+
+    def set_source(self, key, generation=None):
+        with self._state_lock:
+            if generation is not None:
+                self._generation = generation
+            self._source = key or "auto"
+            self._spark_cache.clear()
+            self._failed.clear()
+            return self._generation
+
+    def set_spark_enabled(self, on):
+        with self._state_lock:
+            self._enabled = bool(on)
+            if not on:
+                self._spark_cache.clear()
+                self._failed.clear()
+        self._wake.set()
+
+    def request(self, codes, generation, source):
+        """报价拿到后调这个。**立即返回**，绝不阻塞调用方。
+
+        generation / source 变了就顺手清掉旧缓存 —— 旧 entry 不可能再命中，
+        留着只会让 cache 只增不减（P2-8）。
+        """
+        with self._state_lock:
+            if generation != self._generation or source != self._source:
+                self._spark_cache.clear()
+                self._failed.clear()
+            self._codes = tuple(codes or ())
+            self._generation = generation
+            self._source = source
+        self._wake.set()
+
+    def stop(self):
+        self._stop = True
+        self._wake.set()      # 唤醒它，让它立刻看到停止标志，别睡满 0.5 秒
+        self.wait(self.WORKER_WAIT_MS)
+
+    def run(self):
+        try:
+            self._loop()
+        except Exception:
+            write_crash_log(_crash_text(*sys.exc_info()))
+            self.fatal.emit("分时线程异常停止")
+
+    def _loop(self):
+        while not self._stop:
+            self._wake.wait(0.5)        # 有事立刻醒，没事也不空转
+            if self._stop:
+                return
+            self._wake.clear()
+
+            with self._state_lock:
+                codes = list(self._codes)
+                generation = self._generation
+                source = self._source
+                enabled = self._enabled
+            if not enabled or not codes:
+                continue
+
+            for full in codes:
+                if self._stop:          # 退出时别再一只只慢慢拉
+                    return
+                pts = self._cached(full, source, generation)
+                if pts is None and self._in_backoff(full):
+                    continue            # 刚失败过，这轮别再打网络
+                if pts is None:
+                    pts = self._spark(full, source, generation)
+                if pts is not None:
+                    self.spark_ready.emit(generation, full, pts)
+
+    def _entry(self, full, source, generation):
+        """同一身份（同一个源 + 同一代）的缓存条目，不看过期。"""
+        hit = self._spark_cache.get(full)
+        if not hit:
+            return None
+        if hit.get("source") != source or hit.get("generation") != generation:
+            return None
+        return hit
+
+    def _cached(self, full, source, generation):
+        """缓存里没过期的那份；没有就返回 None（不发请求）。"""
+        entry = self._entry(full, source, generation)
+        if entry and time.time() - entry.get("ts", 0) < self.SPARK_TTL:
+            return entry.get("pts")
+        return None
+
+    def _in_backoff(self, full):
+        return (time.time() - self._failed.get(full, 0)) < self.FAIL_BACKOFF
+
     def _spark(self, full, source, generation):
-        """分时走势，缓存 SPARK_TTL 秒；这次拿不到就先用上次的（同一身份的）。
+        """拉一只的分时。
 
-        ★ 为什么缓存条目必须带 (source, generation)：
-        网络请求期间是不持锁的。旧请求在途时用户切了源 —— 切源会 generation+1
-        并 clear_spark_cache()，但**旧请求回来之后会把它的结果再写一遍**，
-        于是刚清掉的缓存又长回来了，而且装的是旧源的走势。新源下一轮读到它，
-        直接命中、不再发请求 —— 价格是新源的，迷你分时却是旧源画的，
-        最长能吃满整个 TTL。
+        ★ 缓存条目必须带 (source, generation)：网络请求期间不持锁，
+        旧请求在途时用户切了源，它回来之后会把旧源结果写回缓存；
+        新源下一轮读到直接命中 —— 价格是新源的，走势却是旧源画的。
 
-        generation 机制保护的是 rows（旧整批结果会被 UI 丢掉），没保护
-        spark cache。所以这里两道保险都要有：
-          1) entry 带身份，旧身份的 entry 永远不会被新身份命中
+        两道保险：
+          1) entry 带身份，旧身份的永远不会被新身份命中
           2) 网络返回后、写缓存之前，重新确认身份没变
         """
         if not full:
             return None
-        entry = self._spark_entry(full, source, generation)
-        if entry and time.time() - entry.get("ts", 0) < self.SPARK_TTL:
-            return entry.get("pts")
+        hit = self._cached(full, source, generation)
+        if hit is not None:
+            return hit                  # 没过期就不联网
+        now = time.time()
+        with self._state_lock:
+            current_gen = self._generation
+            current_src = self._source
         try:
-            pts = providers.fetch_spark(full, prefer=source)
-            got = pts if (pts and len(pts) >= 2) else None
+            raw = providers.fetch_spark(full, prefer=source)
+            got = raw if (raw and len(raw) >= 2) else None
         except Exception:
             got = None
-        # 网络回来了，世界可能已经变了：这中间用户可能切了源、换了自选。
-        # 从那一刻起旧请求的结果就不属于当前身份，既不能写进缓存也不能用。
-        with self._state_lock:
-            if generation != self._generation or source != self.source:
-                return None
+        # 网络回来了，世界可能已经变了。从那一刻起旧结果就不属于当前身份。
+        if generation != current_gen or source != current_src:
+            return None
         if got:
-            self._spark_cache[full] = {"ts": time.time(), "source": source,
+            self._spark_cache[full] = {"ts": now, "source": source,
                                        "generation": generation, "pts": got}
+            self._failed.pop(full, None)
             return got
-        return (entry or {}).get("pts")     # 这次没拿到，先用上次的（同身份）
+        # 两个源都没给 -> 记一笔，避免每个报价周期都重试（这就是 P0 的放大器）
+        self._failed[full] = now
+        entry = self._entry(full, source, generation)
+        return (entry or {}).get("pts")     # 这轮先用上次的（同身份）
 
 
 class Searcher(QThread):
@@ -1659,6 +1932,7 @@ class Ticker(QWidget):
         self._effect_date = None   # 彩蛋每天只在 14:57 触发一次
         self.err = ""
         self.updated_at = ""
+        self.idx_updated_at = ""   # 大盘指数单独记一个更新时间
         self.quote_date = ""       # 数据是截至哪天的（休市时显示）
         self.drag_pos = None
         self.pulse = 0
@@ -1707,17 +1981,30 @@ class Ticker(QWidget):
             self.move_to_default()
 
         self.fetcher = Fetcher()
+        # 分时走自己的线程：报价拉到就 emit，绝不等走势图（P0）
+        self.sparker = SparkFetcher()
         # 一律走 setter：这些字段 worker 线程同时在读，直接赋值会绕过锁。
         # 顺序有讲究：set_source 和 set_codes 都会让 generation +1，而 UI 只认
         # set_codes 返回的那个 —— 所以 set_codes 必须放最后，否则两边差 1。
         self.fetcher.set_show_index(bool(cfg.get("show_index", True)))
         self.fetcher.set_interval(int(cfg.get("interval") or 3))
         self.fetcher.set_source(cfg.get("data_source") or "auto")
-        self.fetcher.set_spark_enabled(bool(cfg.get("spark", True)))
+        self.sparker.set_spark_enabled(bool(cfg.get("spark", True)))
         self.watchlist_generation = self.fetcher.set_codes(cfg.get("codes") or [])
         self.fetcher.data_ready.connect(self.on_data)
         self.fetcher.failed.connect(self.on_fail)
+        self.sparker.spark_ready.connect(self._on_spark)
+        self.sparker.fatal.connect(self._on_worker_fatal)
+        self.fetcher.fatal.connect(self._on_worker_fatal)
         self.fetcher.start()
+        self.sparker.start()
+
+        # 行情线程死后用户只会看到"挂件还在但价格不动"，很难归因 —— 每 30 秒
+        # 看一眼它是不是还活着，死了就明确说（不建议自动重启：bug 如果是
+        # deterministic 的，会自动进入 crash loop）
+        self._alive_timer = QTimer(self)
+        self._alive_timer.timeout.connect(self._check_workers_alive)
+        self._alive_timer.start(30000)
 
         self.pulse_timer = QTimer(self)
         self.pulse_timer.timeout.connect(self.tick_pulse)
@@ -1806,9 +2093,8 @@ class Ticker(QWidget):
         # generation 没变，照样会收下。
         self.watchlist_generation = self.fetcher.set_source(key)
         self.searcher.set_source(key)
-        # 换源了，老的分时走势不该再留着；set_spark_enabled 会顺手把 tick 归零
-        self.fetcher.clear_spark_cache()
-        self.fetcher.set_spark_enabled(bool(self.cfg.get("spark", True)))
+        # 换源了老的分时走势不该再留着 —— sparker.request() 发现身份变了
+        # 会自己清掉缓存（generation bump + 失效是一个原子操作）
         # 旧源在途的搜索结果也要作废，不然切完源弹回来的还是上一个源的候选
         self.search_seq += 1
 
@@ -1927,7 +2213,7 @@ class Ticker(QWidget):
         （让在途的旧行情作废）→ 落盘。编辑 / 添加 / 删除三个入口都走这里，
         免得漏掉一处就出现"配置里没了、界面上还挂着"的脏状态。
         """
-        codes = [c for c in dict.fromkeys(codes or []) if c][:5]
+        codes = [c for c in dict.fromkeys(codes or []) if c][:MAX_WATCHLIST]
         self.cfg["codes"] = codes
         allowed = set(codes)
         self.rows = [r for r in self.rows if r.get("full") in allowed]
@@ -1942,8 +2228,18 @@ class Ticker(QWidget):
         if full in codes:
             self._close_search()
             return
-        if len(codes) >= 5:
-            codes = codes[:4]          # 满了就挤掉最后一只，让新加的进来
+        if len(codes) >= MAX_WATCHLIST:
+            # 以前是静默挤掉最后一只 —— 用户加完第六只，第五只无声无息没了，
+            # 还以为是自己记错了。现在明确拒绝（要换哪一只由用户自己决定）。
+            # 用托盘气泡而不是模态对话框：加股票是个高频动作，弹窗挡路很烦，
+            # 而且模态框在无人值守时会一直挂着。
+            self._close_search()
+            if getattr(self, "tray", None):
+                self.tray.showMessage(
+                    "A股盯盘",
+                    "最多只能盯 %d 只 —— 请先删掉一只，再添加" % MAX_WATCHLIST,
+                    QSystemTrayIcon.Information, 5000)
+            return
         codes.append(full)
         self.apply_watchlist(codes)
         self._close_search()
@@ -2025,22 +2321,90 @@ class Ticker(QWidget):
         gen = data.get("generation")
         if gen is not None and gen != self.watchlist_generation:
             return
-        self.rows = (data.get("rows") or [])[:5]
-        self.indices = data.get("idx") or []
-        self.err = ""
-        self.updated_at = market_clock.market_now().strftime("%H:%M:%S")
+
+        rows = data.get("rows") or []
+        idx = data.get("idx") or []
+        rows_ok = data.get("rows_ok", bool(rows))
+        rows_error = data.get("rows_error") or ""
+        idx_ok = data.get("idx_ok", bool(idx))
+
+        # ★ 界面的行由**配置里的自选**决定，不是"接口这次返回了几只"（P1）。
+        # 否则某只股票两个源都没有时，窗口会直接从 5 行缩成 4 行 —— 用户分不清
+        # 是自己删了、还是行情源没数据、还是代码错了。缺的那只留一个占位行。
+        self.rows = self._with_placeholders(rows)
+        self.indices = idx
+
+        # ★ 指数成功不能把"股票行情失败"的错误状态擦掉（P1）。
+        # 以前是 `if rows or idx: self.err = ""` —— 只要这一批里有一种数据就算成功，
+        # 于是"核心报价全挂 + 指数正常"时，footer 看起来刚更新、错误提示却消失了。
+        if not rows_ok:
+            self.err = (rows_error or "未取到行情")[:40]
+        else:
+            self.err = ""
+            self.updated_at = market_clock.market_now().strftime("%H:%M:%S")
+        if idx_ok:
+            self.idx_updated_at = market_clock.market_now().strftime("%H:%M:%S")
+
         # 数据是截至哪天的（收盘/休市时显示；接口时间戳优先，认不出才按日历推算）
         self.quote_date = market_clock.last_quote_mmdd(
-            [r.get("time") for r in self.rows])
+            [r.get("time") for r in self.rows
+             if not r.get(ROW_UNAVAILABLE)])
         self.pulse = 3
         self.resize_to_rows()
-        self.check_alert(self.rows)
-        self.check_close_effect(self.rows)
+        # 占位行没有价格，不能参与提醒和彩蛋
+        self.check_alert([r for r in self.rows if not r.get(ROW_UNAVAILABLE)])
+        self.check_close_effect([r for r in self.rows
+                                 if not r.get(ROW_UNAVAILABLE)])
         self.update()
         self.update_tray_tip()
         self.update_tray_icon()
 
+        # 分时要不要更新交给独立线程 —— 这里只是"通知一声"，立即返回（P0）
+        self.sparker.request([c for c in (self.cfg.get("codes") or [])],
+                             self.watchlist_generation,
+                             self.cfg.get("data_source") or "auto")
+
+    def _with_placeholders(self, rows):
+        """按配置顺序补齐行：某只两个源都没有时留占位，而不是让窗口缩一行。"""
+        by_full = {r.get("full"): r for r in rows if r.get("full")}
+        out = []
+        for code in (self.cfg.get("codes") or [])[:MAX_WATCHLIST]:
+            got = by_full.get(code)
+            out.append(got if got is not None else unavailable_row(code))
+        return out
+
+    def _on_spark(self, generation, full, pts):
+        """分时线程回来的结果：只 patch 那一行，且必须是当前这一代。"""
+        if generation != self.watchlist_generation:
+            return                      # 换过自选/切过源，旧结果不要
+        for r in self.rows:
+            if r.get("full") == full:
+                if r.get(ROW_UNAVAILABLE):
+                    return              # 占位行没有走势可画
+                r["spark"] = pts
+                self.update()
+                return
+
+    def _on_worker_fatal(self, what):
+        """行情/分时线程异常停止：必须明说，不能让挂件"活着但不动"。"""
+        self.err = "线程异常，请重启"
+        self.update()
+        if getattr(self, "tray", None):
+            self.tray.showMessage(
+                "A股盯盘", "%s，挂件已停止刷新，请重启程序\n（日志已保存到 logs/）" % what,
+                QSystemTrayIcon.Critical, 10000)
+
+    def _check_workers_alive(self):
+        """看门狗：线程死后不声不响是最难诊断的故障。"""
+        for name, w in (("行情", self.fetcher), ("分时", self.sparker)):
+            if not w.isRunning():
+                self._on_worker_fatal("%s线程已停止" % name)
+                return
+
     def on_fail(self, msg):
+        # 已经报过"线程异常"就别再被普通的取数失败覆盖掉
+        if self.err == "线程异常，请重启":
+            return
         self.err = msg[:40]
         self.update()
 
@@ -2083,13 +2447,34 @@ class Ticker(QWidget):
         """今天生效的节日（同时只有一个），带一次一日的缓存"""
         return active_festival(forced=self._forced_festival)
 
+    def _quote_is_fresh(self, row):
+        """这一行的行情够不够新，配不配叫"实时异动"。
+
+        完整的新鲜度模型留到 v2.2.0；这里先做 minimal guard —— 至少做到：
+        **明显的昨天数据绝不弹实时提醒。**
+        """
+        age = market_clock.stamp_age_seconds(row.get("time"))
+        if age is None:
+            return False                # 时间戳认不出来，按不新鲜处理
+        if age < -60:
+            return False                # 时间戳在未来（接口给错了）
+        if age > ALERT_MAX_AGE_SEC:
+            return False
+        dt = market_clock.parse_quote_stamp(row.get("time"))
+        if dt is None:
+            return False
+        return dt.date() == market_clock.market_now().date()
+
     def check_alert(self, rows):
         """涨跌幅超阈值 → 托盘气泡 + 该行高亮闪烁。
 
-        两道闸门：
+        三道闸门：
         1. 不在交易时段（收盘 / 午休 / 周末 / 法定休市）一律不提醒。收盘后每 60 秒
            还拉一次行情，光靠"5 分钟冷却"会一直重复弹同一条。
-        2. edge-trigger：突破阈值才提醒，回落到 (阈值 - ALERT_REARM_GAP) 以下重新
+        2. ★ 数据必须是**新鲜的**：只看"是不是交易时段"是不够的。provider 完全
+           可能返回一个格式正确、但时间是昨天收盘的 row —— 那时弹出"实时异动 +5%"
+           是假的。要求时间戳能解析、是今天、且不超过 ALERT_MAX_AGE_SEC。
+        3. edge-trigger：突破阈值才提醒，回落到 (阈值 - ALERT_REARM_GAP) 以下重新
            武装，再次突破才再提醒。一直待在阈值外不再重复。
         """
         th = float(self.cfg.get("alert_pct") or 0)
@@ -2101,6 +2486,10 @@ class Ticker(QWidget):
         for r in rows:
             full = r.get("full")
             if not full:
+                continue
+            if r.get(ROW_UNAVAILABLE):
+                continue                # 占位行没有真实价格
+            if not self._quote_is_fresh(r):
                 continue
             pct = abs(r.get("pct", 0))
             if pct >= th:
@@ -2510,6 +2899,7 @@ class Ticker(QWidget):
                 p.drawLine(14, y, w - 14, y)
 
         pct = r["pct"]
+        missing = bool(r.get(ROW_UNAVAILABLE))
         color = (self._up() if pct > 0
                  else (self._down() if pct < 0 else self._flat()))
 
@@ -2562,7 +2952,8 @@ class Ticker(QWidget):
 
         # 这行不是期望的源给的 → 代码后面跟一个灰色小字。正常时一个字都不画：
         # 满屏都是同一个源名是噪音，不是信息；只有"主源没给全、备源补的"才值得说。
-        note = source_note(r.get("provider"), expected_source(self.cfg.get("data_source")))
+        note = (None if missing else
+                source_note(r.get("provider"), expected_source(self.cfg.get("data_source"))))
         if note:
             cw = QFontMetrics(QFont("Microsoft YaHei", 7)).horizontalAdvance(r["code"])
             tx = nx + cw + 5
@@ -2572,7 +2963,8 @@ class Ticker(QWidget):
                            note, self._fg_fade(), ol)
 
         # 停牌 / 涨停 / 跌停：涨跌幅左边挂个实心小标签，一眼能看出来
-        if status != providers.NORMAL:
+        # 占位行除外 —— 它不是停牌，是这一只压根没拿到数据，挂"停牌"是误导
+        if status != providers.NORMAL and not missing:
             self._draw_status_badge(p, status, color, w - 14 - 58 - 30, y + 6)
 
         # 涨跌幅色块
@@ -2603,7 +2995,12 @@ class Ticker(QWidget):
         pw = QFontMetrics(QFont("Microsoft YaHei", 12, QFont.Bold)).horizontalAdvance(price_txt)
         p.setFont(QFont("Microsoft YaHei", 7.5))
         if halted:
-            chg_txt = ""
+            # 占位行要写清楚"数据暂不可用" —— 留空白的话用户会以为是程序坏了
+            chg_txt = "数据暂不可用" if missing else ""
+            if missing:
+                self._text(p, QRect(14 + ox + pw + 6, y + 25, 96, 16),
+                           Qt.AlignVCenter | Qt.AlignLeft, chg_txt,
+                           self._fg_fade(), ol)
         else:
             chg_txt = "%s%.*f" % ("+" if r["change"] > 0 else "", d, r["change"])
             self._text(p, QRect(14 + ox + pw + 6, y + 25, 70, 16),
@@ -3153,7 +3550,13 @@ class Ticker(QWidget):
         self._toggle_action(m, "始终置顶", "always_on_top", self.toggle_top, True)
         self._toggle_action(m, "鼠标穿透（用托盘恢复）", "click_through",
                             self.toggle_click_through)
-        self._toggle_action(m, "开机自启", "autostart", self.toggle_autostart)
+        # 开机自启不读配置 —— 注册表才是唯一真相源（菜单每次打开都会重建，
+        # 所以这里自然就是最新状态；用户在系统设置里改过也能反映出来）
+        a = m.addAction("开机自启")
+        a.setCheckable(True)
+        a.setChecked(get_autostart())
+        a.triggered.connect(self.toggle_autostart)
+        self._autostart_action = a
 
     def _menu_backup(self, m):
         """配置备份 / 回滚：持仓成本被误删过，有存档就能捞回来"""
@@ -3302,7 +3705,7 @@ class Ticker(QWidget):
         on = not self.cfg.get("spark", True)
         self.cfg["spark"] = on
         save_config(self.cfg)
-        self.fetcher.set_spark_enabled(on)   # 关了就别在后台继续拉分时
+        self.sparker.set_spark_enabled(on)   # 关了就别在后台继续拉分时
         if not on:
             for r in self.rows:
                 r["spark"] = None
@@ -3329,15 +3732,23 @@ class Ticker(QWidget):
         self.apply_flags()
 
     def toggle_autostart(self):
-        """先改注册表，成功了才落配置 —— 免得注册表没写进去、菜单却显示成已开启"""
-        want = not self.cfg.get("autostart")
+        """以注册表为准，写完回读校验。
+
+        不再往 stocks.json 里存 autostart：存了就是第二份真相源，两份不一致时
+        菜单显示的那个是假的（Windows 实际行为才是真的）。
+        """
+        want = not get_autostart()
         if not set_autostart(want):
             QMessageBox.warning(
                 self, "开机自启未生效",
-                "写注册表失败，开机自启仍是「%s」。" % ("开" if self.cfg.get("autostart") else "关"))
+                "改注册表失败，开机自启仍是「%s」。\n"
+                "（某些安全软件会拦截；可以手动检查：任务管理器 → 启动）"
+                % ("开" if get_autostart() else "关"))
             return
-        self.cfg["autostart"] = want
-        save_config(self.cfg)
+        # 菜单此刻可能还开着，把勾选状态同步过去
+        a = getattr(self, "_autostart_action", None)
+        if a is not None:
+            a.setChecked(get_autostart())
 
     # ---- 配置备份 / 恢复 ----
     def backup_now(self):
@@ -3387,7 +3798,7 @@ class Ticker(QWidget):
     # ---- 托盘 ----
     def build_tray(self):
         self.tray = QSystemTrayIcon(self)
-        self.tray.setIcon(make_icon(FLAT))
+        self.tray.setIcon(make_trend_icon("flat"))
         self.tray.activated.connect(self._on_tray_activated)
         tm = QMenu()
         tm.setStyleSheet("QMenu{background:#181a20;color:#e8eaed;border:1px solid #2a2d35;padding:5px;}"
@@ -3439,7 +3850,7 @@ class Ticker(QWidget):
         if not self.rows:
             return
         avg = sum(r["pct"] for r in self.rows) / len(self.rows)
-        self.tray.setIcon(make_icon(UP if avg > 0 else (DOWN if avg < 0 else FLAT)))
+        self.tray.setIcon(make_trend_icon(trend_kind(avg)))
 
     def clear_forced_festivals(self):
         """清掉配置里的历史遗留字段（老版本把「强制开启」存进过 stocks.json）。
@@ -3467,6 +3878,8 @@ class Ticker(QWidget):
         if _app is not None:
             _app.removeEventFilter(self)
         self.fetcher.stop()
+        if hasattr(self, "sparker"):
+            self.sparker.stop()
         if hasattr(self, "searcher"):
             self.searcher.stop()
         self.tray.hide()
@@ -3474,6 +3887,10 @@ class Ticker(QWidget):
 
 
 def make_icon(color):
+    """老图标：一个色块圆 + "A" 字（项目缩写）。
+
+    保留着没删 —— 它只代表项目名，不传行情信息；现在默认用 make_trend_icon()。
+    """
     pm = QPixmap(64, 64)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -3488,22 +3905,99 @@ def make_icon(color):
     return QIcon(pm)
 
 
+def make_trend_icon(kind="up"):
+    """折线走向图标 —— 比字母更直接地表达"行情"。
+
+    kind:
+        "up"   涨（挂件涨色 #ff4d4f）
+        "down" 跌（挂件跌色 #22c55e）
+        "flat" 平（挂件平色 #9ca3af）
+
+    末端那个圆点是"最新价"。线条特意画粗（64 里占 8）：托盘 32px、
+    任务栏 16px 都是靠"颜色 + 走向"两个信号叠加才认得出来，细了会糊成一点。
+    """
+    color = {"up": UP, "down": DOWN}.get(kind, FLAT)
+    if kind == "up":
+        pts = [QPoint(8, 46), QPoint(22, 30), QPoint(34, 38), QPoint(50, 16)]
+    elif kind == "down":
+        pts = [QPoint(8, 18), QPoint(22, 34), QPoint(34, 26), QPoint(50, 48)]
+    else:
+        pts = [QPoint(8, 32), QPoint(56, 32)]
+
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(color)
+    pen.setWidth(8)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawPolyline(pts)
+    # 末端的圆点 = 最新价；"平"时点在中间
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    end = pts[-1] if kind != "flat" else QPoint(32, 32)
+    p.drawEllipse(end.x() - 7, end.y() - 7, 14, 14)
+    p.end()
+    return QIcon(pm)
+
+
+def trend_kind(avg):
+    """平均涨跌幅 -> "up" / "down" / "flat"。"""
+    if avg > 0:
+        return "up"
+    if avg < 0:
+        return "down"
+    return "flat"
+
+
+_AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_NAME = "AStockWidget"
+
+
+def get_autostart():
+    """Windows 注册表里现在到底是什么状态 —— 这是唯一真相源。
+
+    ★ 以前同时维护 cfg["autostart"] 和注册表两份：写注册表成功、
+    save_config 失败（或反过来）就会出现"Windows 实际会自启、菜单却显示
+    未开启"。而且两份里必有一份是猜的。
+    """
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY,
+                             0, winreg.KEY_READ)
+        try:
+            winreg.QueryValueEx(key, _AUTOSTART_NAME)
+            return True
+        except FileNotFoundError:
+            return False
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return False
+
+
 def set_autostart(enable):
     try:
         import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_WRITE)
-        name = "AStockWidget"
-        if enable:
-            bat = os.path.join(APP_DIR, "start.bat")
-            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, '"%s"' % bat)
-        else:
-            try:
-                winreg.DeleteValue(key, name)
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
-        return True
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY,
+                             0, winreg.KEY_WRITE)
+        try:
+            if enable:
+                bat = os.path.join(APP_DIR, "start.bat")
+                winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ,
+                                  '"%s"' % bat)
+            else:
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
+        # 写完立刻回读校验 —— 不验证就等同于"假设成功了"
+        return get_autostart() == bool(enable)
     except Exception:
         return False
 
@@ -3683,7 +4177,13 @@ def _run():
             "已在运行",
             0x40 | 0x0,                         # MB_ICONINFORMATION | MB_OK
         )
-        return
+        # ★ 必须是 os._exit，不能 return。
+        # 出现过：关掉上面这个框之后进程**不走完退出流程**，留着 1 个空线程、
+        # 5 MB 内存、0 个窗口，STILL_ACTIVE 地挂着不走 —— 每重复启动一次就
+        # 多留一个僵尸。这个进程什么都没初始化（QApplication 都没建），硬退安全。
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
     cfg = load_config()
     # 注意：这里**不要**把空的 codes 重置成默认三只。用户删光自选股后存下的
@@ -3693,10 +4193,25 @@ def _run():
     if not os.path.exists(CONFIG_PATH):
         save_config(cfg)
 
+    _t_boot = time.time()
+    write_run_log("START    %s  自选 %d 只，间隔 %s 秒，源=%s，分时=%s"
+                  % (APP_VERSION, len(cfg.get("codes") or []),
+                     cfg.get("interval") or 3, cfg.get("data_source") or "auto",
+                     "开" if cfg.get("spark", True) else "关"))
+    # atexit 只在 Python"自己走完"时才执行；被外部强杀时不会执行 ——
+    # 于是日志会停在最后一条 ALIVE 上，没有 EXIT 也没有 STOP（见 _log_exit）
+    global _boot_time
+    _boot_time = _t_boot
+    atexit.register(_log_exit)
+
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
+    # 任务栏窗口图标：默认会是 pythonw.exe 的 Python 官方 logo，丑且和"自选股
+    # 盯盘"不搭。设成我们自己的"A"图标（涨红跌绿平灰，由 trend 决定颜色）。
+    # 托盘图标另外用 make_icon 在 build_tray 时设置 —— 这个是给挂件窗口本身的。
     app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(make_trend_icon("up"))
     w = Ticker(cfg)
     w.show()
 
@@ -3707,7 +4222,16 @@ def _run():
         # 退出时大概率报 "QThread destroyed while running"
         QTimer.singleShot(5000, lambda: (save_shot(w, out), w.quit()))  # noqa: F821
 
-    sys.exit(app.exec())
+    code = app.exec()
+    # 退出时留一行：跑了多久 + 断过几次 + 累计断联时长。
+    # 有这个，"今天稳不稳"才查得出来，不用只靠肉眼看界面。
+    try:
+        write_run_log("STOP     运行 %.1f 分钟，%s"
+                      % ((time.time() - _t_boot) / 60.0,
+                         w.fetcher.health_summary()))
+    except Exception:
+        pass
+    sys.exit(code)
 
 
 if __name__ == "__main__":

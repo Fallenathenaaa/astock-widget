@@ -47,6 +47,7 @@ with io.open(W.CONFIG_PATH, "w", encoding="utf-8") as f:
 app = QApplication([])
 # 必须在建 Ticker 之前屏蔽：线程真跑起来的话，退出时 Qt 会"QThread destroyed while running" 直接 abort（0xC0000409）
 W.Fetcher.start = lambda self: None
+W.SparkFetcher.start = lambda self: None
 W.Searcher.start = lambda self: None
 w = W.Ticker(dict(CFG))
 

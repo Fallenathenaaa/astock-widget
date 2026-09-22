@@ -14,6 +14,9 @@ if not exist "%PYEXE%" (
   echo.
   echo Not installed yet. Running install.bat first ...
   call "%~dp0install.bat"
+  rem Stop if install failed: .venv may exist but pip did not finish,
+  rem and falling through would run the whole install a second time.
+  if errorlevel 1 exit /b 1
 )
 if not exist "%PYEXE%" (
   echo.
@@ -27,11 +30,11 @@ rem versions) must not sneak through just because PySide6 happens to import.
 rem The range comes from the helper -- do not hardcode it here.
 set "HELPER=%~dp0tools\check_python.py"
 set "PYFINDER="
-where py >nul 2>&1
-if not errorlevel 1 set "PYFINDER=py"
-if not defined PYFINDER (
-  where python >nul 2>&1
-  if not errorlevel 1 set "PYFINDER=python"
+for %%C in (py python python3) do (
+  if not defined PYFINDER (
+    where %%C >nul 2>&1
+    if not errorlevel 1 set "PYFINDER=%%C"
+  )
 )
 set "PYMIN="
 set "PYMAX="
@@ -63,6 +66,7 @@ if errorlevel 1 (
   echo.
   echo Dependencies missing. Running install.bat ...
   call "%~dp0install.bat"
+  if errorlevel 1 exit /b 1
 )
 "%PYEXE%" -c "import PySide6" >nul 2>&1
 if errorlevel 1 (

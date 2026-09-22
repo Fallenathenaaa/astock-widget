@@ -39,6 +39,10 @@ _M_CLOSE = 15 * 60              # 收盘
 # ---- 法定休市日（只列"工作日也休市"的那些，周末靠 weekday 排除）----
 # 每年交易所公布后手工维护一次；没维护到的年份会退回"只按 weekday 判断"，
 # 可能把节假日误判成开市 —— 宁可多刷新，也不会少刷新。
+# ★ 已知时间炸弹：现在只有 2026。到 2027 元旦之后，如果还没补上那一年的表，
+# 法定休市的工作日会被当作交易日 —— 快刷、stale 行情可能被当实时、提醒风险更大。
+# 交易所一般在 11~12 月公布次年安排；公布后立刻补进来。
+# tests/test_clock.py 会在每年 12 月起把"明年还没维护"变成红项，不用谁记着。
 MARKET_CLOSED_BY_YEAR = {
     # 2026 年按上交所《关于 2026 年部分节假日休市安排的通知》
     # （上证公告〔2025〕45 号，2025-12-22）逐日换算。
@@ -138,12 +142,46 @@ def has_session_started(now=None):
     return _minutes(now) >= _M_OPEN
 
 
-def stamp_mmdd(stamp):
-    """行情时间戳（yyyymmddHHMMSS）-> "MM-dd"；认不出来返回空串。"""
+def parse_quote_stamp(stamp):
+    """行情时间戳（yyyymmddHHMMSS）-> 带时区的北京时间 datetime。
+
+    认不出来返回 None。
+
+    ★ 只验"前 8 位是不是数字"是不够的：`20269999` 全是数字，但它不是日期。
+    以前它会变成 "99-99"，而且因为字符串比 `20260920` 大，还能把真正的
+    日期压掉。必须按真实日历解析。
+    """
     s = (stamp or "").strip()
     if len(s) < 8 or not s[:8].isdigit():
-        return ""
-    return "%s-%s" % (s[4:6], s[6:8])
+        return None
+    try:
+        dt = datetime.strptime(s[:8], "%Y%m%d")
+    except ValueError:
+        return None                     # 20269999 / 99999999 之类
+    if len(s) >= 14 and s[8:14].isdigit():
+        try:
+            dt = dt.replace(hour=int(s[8:10]), minute=int(s[10:12]),
+                            second=int(s[12:14]))
+        except ValueError:
+            return None
+    return dt.replace(tzinfo=MARKET_TZ)
+
+
+def stamp_mmdd(stamp):
+    """行情时间戳（yyyymmddHHMMSS）-> "MM-dd"；认不出来返回空串。"""
+    dt = parse_quote_stamp(stamp)
+    return "" if dt is None else dt.strftime("%m-%d")
+
+
+def stamp_age_seconds(stamp, now=None):
+    """行情时间戳距今多少秒。解析不出来返回 None。"""
+    dt = parse_quote_stamp(stamp)
+    if dt is None:
+        return None
+    n = now or market_now()
+    if n.tzinfo is not None:
+        n = n.astimezone(MARKET_TZ)
+    return (n - dt).total_seconds()
 
 
 def last_session_mmdd(now=None):
@@ -165,10 +203,14 @@ def last_quote_mmdd(stamps, now=None):
     接口给的时间戳最可靠（节假日、临时休市都能正确反映）；
     一个都解析不出来时才退回按日历推算。
     """
-    # 比的是完整的 yyyymmdd（跨年时 "12-31" 和 "01-02" 光看月日会排错）
-    best = ""
+    # 比的是完整的 yyyymmdd（跨年时 "12-31" 和 "01-02" 光看月日会排错）。
+    # 这里用 parse_quote_stamp 过滤：光看 isdigit 会把 20269999 当成最新日期。
+    best = None
     for s in stamps or ():
-        d = (s or "").strip()[:8]
-        if len(d) == 8 and d.isdigit() and d > best:
+        dt = parse_quote_stamp(s)
+        if dt is None:
+            continue
+        d = dt.strftime("%Y%m%d")
+        if best is None or d > best:
             best = d
     return stamp_mmdd(best) if best else last_session_mmdd(now)

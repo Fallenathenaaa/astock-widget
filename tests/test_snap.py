@@ -39,7 +39,8 @@ if os.path.exists(real_cfg):
 W.CONFIG_PATH = os.path.join(tmp, "stocks.json")
 
 app = QApplication([])
-W.Fetcher.start = lambda self: None    # 同上：别让线程在退出时把进程 abort 掉
+W.Fetcher.start = lambda self: None
+W.SparkFetcher.start = lambda self: None    # 同上：别让线程在退出时把进程 abort 掉
 W.Searcher.start = lambda self: None
 # 深拷贝：DEFAULT_CONFIG 里有 positions / codes 这种可变子对象，浅拷贝会
 # 让测试里的改动漏到全局默认上，污染同一进程里后面的用例

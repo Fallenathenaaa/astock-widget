@@ -311,6 +311,21 @@ chk("真从 JSON 走一遍",
     == W.DEFAULT_CONFIG["title"])
 chk("超长标题仍然截断", len(W.validate_config({"title": "x" * 50})["title"]) == 12)
 
+
+print("== 开机自启：Windows 注册表才是唯一真相源 ==")
+# 以前 cfg["autostart"] 和注册表各存一份：写注册表成功、save_config 失败
+# （或反过来）就会出现"Windows 实际会自启、菜单却显示未开启"。
+chk("配置里已经没有 autostart 字段", "autostart" not in W.DEFAULT_CONFIG)
+chk("老配置里的 autostart 会被丢掉",
+    "autostart" not in W.validate_config({"autostart": True, "title": "x"}),
+    W.validate_config({"autostart": True}))
+chk("真从 JSON 走一遍也是丢掉",
+    "autostart" not in W.validate_config(json.loads('{"autostart": true}')))
+# 不在这里真改注册表（那会动到用户的开机启动项），只验函数本身不崩、
+# 返回的是布尔
+v = W.get_autostart()
+chk("get_autostart() 返回布尔", isinstance(v, bool), v)
+
 print("== 超大整数不能把整份持仓清空 ==")
 # float(10**400) 抛的是 **OverflowError**。_finite_positive 自己写 float(v)
 # 那版只兜了 (TypeError, ValueError)，于是 sanitize_positions 整体炸出来，

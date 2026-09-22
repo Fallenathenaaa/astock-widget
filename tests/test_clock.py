@@ -153,10 +153,32 @@ chk("标准时间戳", MC.stamp_mmdd("20260918161436") == "09-18", MC.stamp_mmdd
 chk("空串返回空", MC.stamp_mmdd("") == "")
 chk("太短返回空", MC.stamp_mmdd("2026") == "")
 chk("非数字返回空", MC.stamp_mmdd("abcdefgh1234") == "")
+# 只验"前 8 位是不是数字"是不够的：20269999 全是数字，但它不是日期。
+# 以前会变成 "99-99"，而且因为比 20260920 大还能把真日期压掉。
+for bad in ("20269999", "20269999161436", "99999999", "20261332", "20260230"):
+    chk("%r 不是真日期 → 空" % bad, MC.stamp_mmdd(bad) == "", MC.stamp_mmdd(bad))
+chk("parse_quote_stamp 认得出正常时间戳",
+    MC.parse_quote_stamp("20260918161436") is not None)
+chk("parse_quote_stamp 对 20269999 返回 None",
+    MC.parse_quote_stamp("20269999") is None)
+chk("解析出的日期对得上",
+    MC.parse_quote_stamp("20260918161436").strftime("%Y-%m-%d %H:%M:%S")
+    == "2026-09-18 16:14:36", MC.parse_quote_stamp("20260918161436"))
+chk("带北京时间时区", MC.parse_quote_stamp("20260918161436").tzinfo is not None)
+chk("age 算得出来", MC.stamp_age_seconds("20260918161436") > 0)
+chk("认不出来的 age 是 None", MC.stamp_age_seconds("20269999") is None)
+chk("空串 age 是 None", MC.stamp_age_seconds("") is None)
 
 print("== 截至日期 ==")
 chk("一批里挑最新的",
     MC.last_quote_mmdd(["20260916150000", "20260918161436", "20260917150000"]) == "09-18")
+# 假日期不能因为"字符串更大"就把真日期压掉
+chk("假日期不参与挑选",
+    MC.last_quote_mmdd(["20260918161436", "20269999161436"]) == "09-18",
+    MC.last_quote_mmdd(["20260918161436", "20269999161436"]))
+chk("全是假日期 → 退回按日历推算",
+    MC.last_quote_mmdd(["20269999", "99999999"]) == MC.last_session_mmdd(),
+    MC.last_quote_mmdd(["20269999"]))
 chk("跨年比较正确", MC.last_quote_mmdd(["20251231150000", "20260102150000"]) == "01-02")
 chk("周五收盘后 = 当天", MC.last_quote_mmdd([], at("2026-09-18 20:00")) == "09-18")
 chk("周六退到周五", MC.last_quote_mmdd([], at("2026-09-19 10:00")) == "09-18")
@@ -183,6 +205,12 @@ if today.month >= 12:
     chk("12 月起必须已经维护好明年（%d）" % (today.year + 1),
         MC.calendar_is_maintained(today.year + 1),
         "该去补 %d 年的休市日了" % (today.year + 1))
+elif not MC.calendar_is_maintained(today.year + 1):
+    # 还不到 12 月就不算失败（公告可能还没出），但在日志里留个记号。
+    # 用 print 而不是 chk —— 断言会随着"有没有维护"改变项数，那总数就又
+    # 变成环境相关了。
+    print("  note  %d 年的休市日还没维护；到 12 月这条会变成必须修的红项"
+          % (today.year + 1))
 
 print()
 print("%d passed, %d failed" % (ok, fail))

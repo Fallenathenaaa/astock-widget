@@ -15,11 +15,14 @@ import json
 import tempfile
 import threading
 import time
+from datetime import timedelta
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import widget as W  # noqa: E402
+import providers as P  # noqa: E402
 import market_clock  # noqa: E402
+from PySide6.QtCore import QThread  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 ok = fail = 0
@@ -37,10 +40,17 @@ def chk(n, c, x=""):
 
 tmp = tempfile.mkdtemp(prefix="astock-async-")
 W.CONFIG_PATH = os.path.join(tmp, "stocks.json")
+# 这个文件会跑**真的** worker 线程（P0 那几条），worker 失败时会写运行日志 ——
+# 不把 LOG_DIR 也指到临时目录，就会在仓库里留下真实的 logs/
+W.LOG_DIR = os.path.join(tmp, "logs")
 
 app = QApplication([])
 # 别让线程真跑起来：退出时 Qt 会 "QThread destroyed while running" 直接 abort
+# 屏蔽只是默认；P0 那几条要真跑线程，所以把真正的 start 留一份
+_real_fetcher_start = QThread.start
+_real_sparker_start = QThread.start
 W.Fetcher.start = lambda self: None
+W.SparkFetcher.start = lambda self: None
 W.Searcher.start = lambda self: None
 
 cfg = copy.deepcopy(W.DEFAULT_CONFIG)
@@ -49,9 +59,11 @@ w = W.Ticker(cfg)
 
 
 def row(full, code, name, pct=0.0):
+    # 时间戳用"现在"：提醒现在要查新鲜度，写死日期会在第二天集体失效
     return {"full": full, "code": code, "name": name, "price": 10.0,
             "prev": 10.0, "change": 0.0, "pct": pct, "decimals": 2,
-            "time": "20260918150000", "status": "normal"}
+            "time": market_clock.market_now().strftime("%Y%m%d%H%M%S"),
+            "status": "normal"}
 
 
 def emit(rows, idx=None, gen=None):
@@ -114,8 +126,12 @@ w.add_stock({"full": "sz000001", "code": "000001", "name": "平安银行"})
 chk("重复添加不生效", w.cfg["codes"] == ["sh600519", "sz000001"], w.cfg["codes"])
 w.apply_watchlist(["sh600519", "sz000001", "sz300750", "sh601318", "sh600036"])
 chk("先填满 5 只", len(w.cfg["codes"]) == 5)
+# 满 5 只之后再加：以前会静默挤掉最后一只（用户加完第六只，第五只无声无息
+# 没了，还以为是自己记错了）。现在明确拒绝 —— 要换哪一只由用户自己决定。
 w.add_stock({"full": "sh688981", "code": "688981", "name": "中芯国际"})
-chk("满了就挤掉最后一只", w.cfg["codes"][-1] == "sh688981", w.cfg["codes"])
+chk("满了就拒绝，最后一只没被挤掉", w.cfg["codes"][-1] == "sh600036",
+    w.cfg["codes"])
+chk("被拒的那只没进来", "sh688981" not in w.cfg["codes"], w.cfg["codes"])
 chk("满了之后仍是 5 只", len(w.cfg["codes"]) == 5, w.cfg["codes"])
 
 # ------------------------------------------------------------ 搜索 seq
@@ -220,6 +236,39 @@ try:
 finally:
     market_clock.market_phase = _real_phase
     w.cfg["alert_pct"] = 3.0
+
+
+print("== 异动提醒：旧数据不许当实时提醒 ==")
+# 光看"是不是交易时段"不够 —— provider 可能返回一个格式正确、
+# 但时间是昨天收盘的 row，那时弹"实时异动 +5%"是假的。
+_real_phase2 = market_clock.market_phase
+try:
+    market_clock.market_phase = lambda now=None: market_clock.MORNING
+    w.cfg["alert_pct"] = 3.0
+
+    def alert_with(time_str):
+        w._alert_armed.clear()
+        w.flash.clear()
+        w.check_alert([row("sh600519", "600519", "贵州茅台", pct=5.0)
+                       | {"time": time_str}])
+        return bool(w.flash)
+
+    today = market_clock.market_now()
+    chk("今天且新鲜 → 提醒", alert_with(today.strftime("%Y%m%d%H%M%S")))
+    chk("昨天 → 不提醒",
+        not alert_with((today - timedelta(days=1)).strftime("%Y%m%d150000")))
+    chk("今天但太旧（3 小时前）→ 不提醒",
+        not alert_with((today.replace(hour=0, minute=0, second=0)
+                        ).strftime("%Y%m%d%H%M%S")))
+    chk("时间戳是 20269999（不是日期）→ 不提醒", not alert_with("20269999"))
+    chk("时间戳是 99999999 → 不提醒", not alert_with("99999999"))
+    chk("时间戳为空 → 不提醒", not alert_with(""))
+    chk("未来的时间戳 → 不提醒",
+        not alert_with((today + timedelta(days=1)).strftime("%Y%m%d%H%M%S")))
+finally:
+    market_clock.market_phase = _real_phase2
+    w._alert_armed.clear()
+    w.flash.clear()
 
 print("== 收盘彩蛋：整段窗口内只触发一次 ==")
 w.cfg["effect_pct"] = 3.0
@@ -334,14 +383,19 @@ print("== 切数据源后，旧源的分时不能污染新源的缓存 ==")
 # 用 Event 卡住时序，不用 sleep 猜：让旧请求精确地停在"网络已发出、还没返回"。
 _real_spark = W.providers.fetch_spark
 calls = []
-f = W.Fetcher()
+f = W.SparkFetcher()
 f.set_codes(["sh600519"])
 gen_t = f._generation
 
 
+_blocked = []
+
+
 def fake_spark(full, prefer="auto"):
     calls.append((full, prefer))
-    if len(calls) == 1:              # 第一通（旧源）卡住，等切完源再放行
+    # 只卡住"第一通请求"，不能靠 len(calls)（测试中间会 clear，又会卡一次）
+    if not _blocked:
+        _blocked.append(1)
         started.set()
         release.wait(5)
     return [10.0, 10.2, 10.1] if prefer == "tencent" else [20.0, 20.5, 20.3]
@@ -356,9 +410,8 @@ t.start()
 try:
     chk("旧请求确实卡在网络里", started.wait(5))
 
-    # 用户此刻切源：generation+1 + 清空缓存
-    f.set_source("sina")
-    f.clear_spark_cache()
+    # 用户此刻切源：新的 generation + 清空缓存
+    f.set_source("sina", gen_t + 1)
     gen_s = f._generation
     release.set()
     t.join(5)
@@ -382,8 +435,7 @@ try:
 
     # 换回腾讯（又一代）→ 新浪那条不该被命中
     calls.clear()
-    f.set_source("tencent")
-    gen_t2 = f._generation
+    gen_t2 = f.set_source("tencent", gen_s + 1)
     pts_t = f._spark("sh600519", "tencent", gen_t2)
     chk("切回腾讯后拿到的确实是腾讯的走势", pts_t == [10.0, 10.2, 10.1], pts_t)
 finally:
@@ -393,12 +445,12 @@ finally:
     W.providers.fetch_spark = _real_spark
 
 print("== 换自选股也要让旧分时失效 ==")
-f2 = W.Fetcher()
+f2 = W.SparkFetcher()
 f2.set_codes(["sh600519"])
 gen1 = f2._generation
 f2._spark_cache["sh600519"] = {"ts": time.time(), "source": "auto",
                                "generation": gen1, "pts": [1.0, 2.0, 3.0]}
-f2.set_codes(["sz000001"])          # 换自选 → 又一代
+f2.set_codes(["sz000001"], gen1 + 1)   # 换自选 → 又一代
 gen2 = f2._generation
 chk("换自选 → generation +1", gen2 == gen1 + 1, (gen1, gen2))
 calls.clear()
@@ -419,43 +471,42 @@ print("== 切源 / 换自选后，当轮就要拉新身份的分时 ==")
 
 def race_fill(bump, label, src_old, src_new):
     """bump: 让身份变化的那个动作（set_source / set_codes）。"""
-    fx = W.Fetcher()
+    fx = W.SparkFetcher()
     fx.set_codes(["sh600519"])
     g_old = fx._generation
     seen = []
 
+    blocked = []
+
     def fake(full, prefer="auto"):
         seen.append((full, prefer))
-        if len(seen) == 1:              # 旧身份的第一通请求卡住
+        if not blocked:                 # 只卡住第一通（旧身份的）
+            blocked.append(1)
             go.set()
             done.wait(5)
         return [10.0, 10.2] if prefer == "tencent" else [20.0, 20.5]
 
     go, done = threading.Event(), threading.Event()
     W.providers.fetch_spark = fake
-    old_rows = [{"full": "sh600519"}]
+    box = {}
     t = threading.Thread(
-        target=lambda: fx._fill_spark(old_rows, True, src_old, g_old))
+        target=lambda: box.update(v=fx._spark("sh600519", src_old, g_old)))
     t.start()
     try:
         if not go.wait(5):
-            chk("%s：旧 _fill_spark 卡进网络" % label, False, "没等到")
+            chk("%s：旧 spark 请求卡进网络" % label, False, "没等到")
             return
         g_new = bump(fx)                # 身份变化（切源 / 换自选）
-        fx.clear_spark_cache()
         done.set()
         t.join(5)
 
         # 新身份的**当轮**就必须真的去拉，不能返回全 None
         seen.clear()
-        new_rows = [{"full": "sh600519"}]
-        fx._fill_spark(new_rows, True, src_new, g_new)
+        pts = fx._spark("sh600519", src_new, g_new)
         chk("%s：当轮就发新身份的 spark 请求" % label, seen != [], seen)
-        chk("%s：当轮就拿到分时，不是 None" % label,
-            new_rows[0].get("spark") is not None, new_rows[0].get("spark"))
+        chk("%s：当轮就拿到分时，不是 None" % label, pts is not None, pts)
         chk("%s：拿到的是新身份的走势" % label,
-            new_rows[0].get("spark") == [20.0, 20.5] or src_new == "tencent",
-            new_rows[0].get("spark"))
+            pts == [20.0, 20.5] or src_new == "tencent", pts)
     finally:
         done.set()
         t.join(5)
@@ -463,8 +514,124 @@ def race_fill(bump, label, src_old, src_new):
         W.providers.fetch_spark = _real_spark
 
 
-race_fill(lambda fx: fx.set_source("sina"), "切源", "tencent", "sina")
-race_fill(lambda fx: fx.set_codes(["sh600519"]), "换自选", "auto", "auto")
+race_fill(lambda fx: fx.set_source("sina", fx._generation + 1), "切源",
+          "tencent", "sina")
+race_fill(lambda fx: fx.set_codes(["sh600519"], fx._generation + 1), "换自选",
+          "auto", "auto")
+
+
+print("== P0：spark 卡死，不许挡住核心报价 ==")
+# 这是 P0 的核心：报价早就取到了，以前要等 5 只 spark 拉完才 emit。
+# 两个分时接口同时挂时，价格最长接近 60 秒不刷新。
+_real_quotes = W.providers.fetch_quotes
+_real_spark_fn = W.providers.fetch_spark
+stuck = threading.Event()
+
+
+def quick_quotes(codes, prefer="auto"):
+    """报价：立即返回"""
+    return [P.make_quote(c, c[2:], "测试", "11.0", "10.0", volume=100)
+            for c in codes]
+
+
+def stuck_spark(code, prefer="auto"):
+    stuck.wait(120)          # 永久卡住（模拟分时接口挂了）
+    return None
+
+
+W.providers.fetch_quotes = quick_quotes
+W.providers.fetch_spark = stuck_spark
+got = []
+fq = W.Fetcher()
+fq.set_interval(1)
+fq.set_codes(["sh600519"])
+fq.data_ready.connect(got.append)
+_real_fetcher_start(fq)
+try:
+    end = time.time() + 5
+    while time.time() < end and not got:
+        QApplication.processEvents()      # 跨线程信号要事件循环才会投递
+        time.sleep(0.05)
+    chk("spark 卡死时报价照样发出", bool(got), got)
+    if got:
+        _r = got[0].get("rows") or []
+        chk("报价里带着行", bool(_r), got[0])
+        if _r:
+            chk("行里带着价格", _r[0].get("price") == 11.0, _r[0])
+        chk("rows_ok 为真", got[0].get("rows_ok") is True, got[0])
+finally:
+    fq._stop = True
+    stuck.set()
+    fq.wait(W.Fetcher.WORKER_WAIT_MS)
+    W.providers.fetch_quotes = _real_quotes
+    W.providers.fetch_spark = _real_spark_fn
+
+print("== P0：spark 慢/失败，报价节奏不受影响 ==")
+# 5 只 spark 每只都慢 0.3 秒：如果还在关键路径上，一轮要多花 1.5 秒
+slow_got = []
+W.providers.fetch_quotes = quick_quotes
+
+
+def slow_spark(code, prefer="auto"):
+    time.sleep(0.3)
+    return None              # 两源都失败
+
+
+W.providers.fetch_spark = slow_spark
+# 非交易时段会走 slow=60 秒一轮，那就测不出节奏了 —— 这里按活跃时段算
+_real_active = market_clock.is_active
+market_clock.is_active = lambda: True
+fs = W.Fetcher()
+fs.set_interval(1)
+fs.set_codes(["sh600519", "sz000001", "sz300750", "sh000001", "sz399001"])
+fs.data_ready.connect(slow_got.append)
+_real_fetcher_start(fs)
+try:
+    end = time.time() + 3.2
+    while time.time() < end:
+        QApplication.processEvents()
+        time.sleep(0.05)
+    # 解耦后：1 秒一轮，3 秒至少 2 轮。如果 spark 还在关键路径上，
+    # 一轮要 1 + 5*0.3 = 2.5 秒，3 秒只够 1 轮。
+    chk("报价节奏没有被 spark 拖慢", len(slow_got) >= 2, len(slow_got))
+finally:
+    fs._stop = True
+    fs.wait(W.Fetcher.WORKER_WAIT_MS)
+    market_clock.is_active = _real_active
+    W.providers.fetch_quotes = _real_quotes
+    W.providers.fetch_spark = _real_spark_fn
+
+print("== P0：旧身份的 spark 不许 patch 新行 ==")
+w.rows = [{"full": "sh600519", "spark": None}]
+w.watchlist_generation = 5
+w._on_spark(5, "sh600519", [1.0, 2.0, 3.0])
+chk("同一代 → patch 上了", w.rows[0]["spark"] == [1.0, 2.0, 3.0],
+    w.rows[0].get("spark"))
+w.rows[0]["spark"] = None
+w._on_spark(4, "sh600519", [9.0, 9.0, 9.0])
+chk("旧一代 → 不 patch", w.rows[0]["spark"] is None, w.rows[0].get("spark"))
+# 占位行没有走势可画
+w.rows = [dict(W.unavailable_row("sh600519"))]
+w._on_spark(5, "sh600519", [1.0, 2.0, 3.0])
+chk("占位行不接分时", w.rows[0].get("spark") is None, w.rows[0].get("spark"))
+
+print("== P0：退出时两个线程都 bounded stop ==")
+W.providers.fetch_quotes = quick_quotes
+W.providers.fetch_spark = lambda *a, **k: None
+fz, sz = W.Fetcher(), W.SparkFetcher()
+fz.set_codes(["sh600519"])
+_real_fetcher_start(fz)
+_real_sparker_start(sz)
+time.sleep(0.4)
+t0 = time.time()
+fz.stop()
+sz.stop()
+cost = time.time() - t0
+budget = (W.Fetcher.WORKER_WAIT_MS + W.SparkFetcher.WORKER_WAIT_MS) / 1000.0 + 2
+chk("stop 是有界的", cost < budget, (cost, budget))
+chk("两个线程都停了", not fz.isRunning() and not sz.isRunning())
+W.providers.fetch_quotes = _real_quotes
+W.providers.fetch_spark = _real_spark_fn
 
 print()
 print("%d passed, %d failed" % (ok, fail))

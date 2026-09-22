@@ -24,11 +24,11 @@ set "PYCMD="
 rem The supported range also gets quoted in the messages below, so ask the
 rem helper for it -- otherwise "3.10 - 3.14" is just another copy that drifts.
 set "PYFINDER="
-where py >nul 2>&1
-if not errorlevel 1 set "PYFINDER=py"
-if not defined PYFINDER (
-  where python >nul 2>&1
-  if not errorlevel 1 set "PYFINDER=python"
+for %%C in (py python python3) do (
+  if not defined PYFINDER (
+    where %%C >nul 2>&1
+    if not errorlevel 1 set "PYFINDER=%%C"
+  )
 )
 set "PYMIN="
 set "PYMAX="
@@ -70,6 +70,8 @@ if not exist "%PYEXE%" (
     exit /b 1
   )
   echo Creating virtual environment with: %PYCMD%
+  rem The --find output may be "py -3.13" or a full path with spaces,
+  rem so it is used as-is; quoting it as one token would break it.
   %PYCMD% -m venv "%VENV%"
 )
 
