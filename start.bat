@@ -2,6 +2,14 @@
 cd /d "%~dp0"
 rem A-Share desktop ticker launcher
 rem
+rem Portable mode first: if this folder ships with its own bundled Python
+rem (py\pythonw.exe, from the "portable" download), use it directly. No
+rem install, no venv, no system Python needed. Everything below is only the
+rem fallback for a plain source checkout (run install.bat to build a .venv).
+if exist "%~dp0py\pythonw.exe" (
+  start "" "%~dp0py\pythonw.exe" "%~dp0widget.py"
+  exit /b 0
+)
 rem Use only the interpreter in this project's own .venv; run
 rem install.bat first if it is missing. Do not guess which system
 rem python has PySide6: a wrong guess starts a process with missing
