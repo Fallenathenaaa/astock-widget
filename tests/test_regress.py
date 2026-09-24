@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import time
+import datetime
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -180,6 +181,18 @@ w._dot_taps_at = time.time() - W.DOT_TAP_WINDOW - 1   # 中间停了超过窗口
 tap()
 chk("点太慢 → 不算数", w._unlocked is False)
 
+# ★ 下面这两段都要求"今天不是触发日"。这个假设**不能依赖真实日期**：
+# 放彩蛋的日子是"假期开始前最后一个交易日"，所以一年里有好几天天然就是
+# 触发日（临近长假的那几天）。之前没钉日期，于是一到长假前测试就集体变红。
+# 这里把日期钉死在远离任何触发日的一天，测的才是判定逻辑本身。
+_real_market_now = W.market_clock.market_now
+_safe_day = datetime.datetime(2026, 3, 10, 10, 30, 0)
+W.market_clock.market_now = lambda: _safe_day
+W._fest_cache.clear()
+chk("测试用的日期确实不是触发日",
+    W.active_festival(today=_safe_day.date()) is None,
+    W.active_festival(today=_safe_day.date()))
+
 print("== 强制节日是运行时状态，不落盘 ==")
 # 强制开关只活在内存里：崩溃 / 强杀之后下次启动必须回到"按日期自动触发"，
 # 不能像以前那样从 stocks.json 里把上次的强制特效读回来。
@@ -217,6 +230,9 @@ chk("关掉后不要动画", w._need_anim() is False)
 w._forced_festival = "midautumn"
 chk("藏起来时不画动画（省 CPU）", (w.hide(), w._need_anim())[1] is False)
 w._forced_festival = None
+# 日期恢复真实值，别影响后面的用例
+W.market_clock.market_now = _real_market_now
+W._fest_cache.clear()
 
 print("== 清理历史遗留字段 ==")
 # 老版本把"强制开启"写进过 stocks.json，新版本要能把这些残留键删掉

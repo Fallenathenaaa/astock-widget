@@ -46,7 +46,7 @@ import providers
 from providers import HALT, LIMIT_UP, LIMIT_DN
 
 APP_NAME = "A股桌面盯盘挂件"
-APP_VERSION = "v2.1.6"
+APP_VERSION = "v2.1.7"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "stocks.json")
@@ -4177,10 +4177,15 @@ def _run():
             "已在运行",
             0x40 | 0x0,                         # MB_ICONINFORMATION | MB_OK
         )
-        # ★ 必须是 os._exit，不能 return。
-        # 出现过：关掉上面这个框之后进程**不走完退出流程**，留着 1 个空线程、
-        # 5 MB 内存、0 个窗口，STILL_ACTIVE 地挂着不走 —— 每重复启动一次就
-        # 多留一个僵尸。这个进程什么都没初始化（QApplication 都没建），硬退安全。
+        # os._exit 而不是 return：这个进程什么都没初始化（QApplication 都没建），
+        # 硬退最干净，保证不留任何残留。
+        #
+        # ★ 别被"两个 pythonw.exe"骗了：Windows 上 pythonw.exe 启动脚本时
+        # **本来就会**产生两个进程 —— 一个加载器（约 5~10 MB、1 个线程、没有
+        # 窗口）+ 一个真正的解释器（100 MB 以上、十几个线程、有窗口）。
+        # 实测过：拿 pythonw 跑一个只 sleep 的空脚本，照样是 2 个进程。
+        # 所以看到两个是**正常的**，那个小的是**父进程** ——
+        # 千万别去杀它，杀了挂件会跟着一起没。
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)

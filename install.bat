@@ -38,8 +38,12 @@ if defined PYFINDER (
     set "PYMAX=%%B"
   )
 )
-if not defined PYMIN set "PYMIN=see"
-if not defined PYMAX set "PYMAX=tools\check_python.py --range"
+rem 兜底：cmd 不会做 shell 命令替换，"set "PYMAX=tools\check_python.py --range""
+rem 只是把字面字符串赋给 PYMAX，所以如果前面的 for /f 没赋值成功，错误信息
+rem 会变成 "needs see - tools\check_python.py --range"（之前真出过）。
+rem 这里给个与 README 一致的兜底字符串。
+if not defined PYMIN set "PYMIN=3.10"
+if not defined PYMAX set "PYMAX=3.14"
 
 if not exist "%PYEXE%" (
   where py >nul 2>&1
