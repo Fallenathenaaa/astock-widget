@@ -7,6 +7,22 @@ rem (py\pythonw.exe, from the "portable" download), use it directly. No
 rem install, no venv, no system Python needed. Everything below is only the
 rem fallback for a plain source checkout (run install.bat to build a .venv).
 if exist "%~dp0py\pythonw.exe" (
+  rem Preflight with the CONSOLE python first: if the bundle is damaged,
+  rem a DLL is missing, or the _pth is wrong, pythonw exits SILENTLY -- and
+  rem most imports run BEFORE the crash handler exists, so there would be no
+  rem crash log at all. The user would just see "nothing happened".
+  "%~dp0py\python.exe" -c "import PySide6, providers, market_clock" >nul 2>&1
+  if errorlevel 1 (
+    echo.
+    echo ERROR: the bundled Python runtime is incomplete.
+    echo Details:/r/n    "%~dp0py\python.exe" -c "import PySide6, providers, market_clock"
+    echo.
+    echo Fix: re-download the portable zip and extract it COMPLETELY
+    echo      (do not copy only part of the folder).
+    echo.
+    pause
+    exit /b 1
+  )
   start "" "%~dp0py\pythonw.exe" "%~dp0widget.py"
   exit /b 0
 )

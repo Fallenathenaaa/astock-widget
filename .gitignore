@@ -21,6 +21,9 @@ __pycache__/
 .venv/
 venv/
 
+# 便携版构建产物（80 MB+ 的 zip，走 Release 附件发布，不入库）
+dist/
+
 # 临时截图 / 调试脚本
 _*.py
 _*.png

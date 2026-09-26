@@ -297,11 +297,21 @@ _MUTEX = "Local\\AStockWidget-Test-%d" % os.getpid()
 
 _holder = None
 try:
-    _code = ("import ctypes,time;"
+    # 让子进程建好 mutex 后**主动打一行**告诉我，而不是靠 sleep 猜。
+    # 两个原因：
+    #   1) 固定 sleep(1.0) 在慢机器 / CI（没有 .pyc 缓存，Python 冷启动更慢）
+    #      上不够，子进程还没建好 mutex，断言就红了 —— 真在干净 checkout 上红过
+    #   2) 更麻烦的是 _singleton_check 第一次调用时若 mutex 不存在，会**自己
+    #      创建并持有**，之后因为 _held_mutexes 里已有它，永远返回 False ——
+    #      所以光把 sleep 加长也救不回来，必须等子进程真的先建好
+    _code = ("import ctypes,sys,time;"
              "ctypes.windll.kernel32.CreateMutexW(None, False, %r);"
+             "sys.stdout.write('ok\\n');"
+             "sys.stdout.flush();"
              "time.sleep(60)" % _MUTEX)
-    _holder = subprocess.Popen([sys.executable, "-c", _code])
-    time.sleep(1.0)          # 等子进程把 mutex 建好
+    _holder = subprocess.Popen([sys.executable, "-c", _code],
+                               stdout=subprocess.PIPE, text=True)
+    _holder.stdout.readline()      # 阻塞到子进程把 mutex 建好为止
     chk("别人占着 mutex → 检测到已有实例", W._singleton_check(_MUTEX) is True)
 finally:
     if _holder is not None:

@@ -46,7 +46,7 @@ import providers
 from providers import HALT, LIMIT_UP, LIMIT_DN
 
 APP_NAME = "A股桌面盯盘挂件"
-APP_VERSION = "v2.1.7"
+APP_VERSION = "v2.1.8"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "stocks.json")
@@ -595,6 +595,11 @@ def unavailable_row(full):
         ROW_UNAVAILABLE: True,
         "spark": None,
     }
+
+# 这一行行情自己的时间戳超过这么多秒就算"旧了"。
+# 不是崩溃级问题，是数据可信度问题：footer 显示的是"程序什么时候收到这一批"，
+# 不是行情自己的时间 —— 10:20 的数据 10:30 才送到，界面不该看着像刚更新。
+STALE_SEC = 120
 
 IDLE_TICK_MS = 500     # 平时心跳：2fps，只用来倒计时 pulse / 清理过期状态
 ANIM_TICK_MS = 50      # 有动画时的心跳：20fps（飘落物 / 火焰 / 冰霜）
@@ -1326,6 +1331,25 @@ def source_note(provider, expected):
     return ""
 
 
+def _quote_age_sec(row):
+    """这一行行情自己的时间戳离现在多少秒；认不出来返回 None。
+
+    ★ 必须看行情**自己**的时间戳，不能看"程序什么时候收到的"：
+    断线重连、源切换、接口返回旧数据时，后者会把几分钟前（甚至上一交易日）
+    的行情显示成"刚更新"，用户会当实时价看。
+    """
+    t = (row.get("time") or "").strip()
+    if len(t) < 14:
+        return None
+    try:
+        dt = datetime.strptime(t[:14], "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    # 接口给的是北京时间但没带时区标记，补上再比（market_now 是带时区的）
+    dt = dt.replace(tzinfo=market_clock.MARKET_TZ)
+    return (market_clock.market_now() - dt).total_seconds()
+
+
 def parse_positions(text):
     """"600519=1250:100, 000001=11.5" -> {"sh600519": {"cost":1250.0,"shares":100}, ...}
 
@@ -1541,9 +1565,28 @@ class Fetcher(QThread):
             self._generation += 1
             return self._generation
 
-    def stop(self):
+    def request_stop(self):
+        """只广播停止意图：**设标志 + 唤醒**，绝不等待。
+
+        ★ 退出时三个 worker 必须**先全部收到信号，再统一 wait**。
+        如果串行 stop()（设 A → 等 A → 设 B → 等 B → ...），三个都卡在网络里时
+        实际是"等 A 超时 → 才轮到通知 B → 等 B 超时 → ..."，最坏退出时间变成
+        三个 timeout 相加。拆成广播 + 统一 wait 后，三者同时开始收敛，
+        总耗时约等于最慢的那一个。
+        """
         self._stop = True
+        wake = getattr(self, "_wake", None)
+        if wake is not None:
+            wake.set()      # 唤醒它，让它立刻看到标志，别睡满等待间隔
+
+    def join_stop(self):
+        """等它真正退出（有界，不会把退出拖成无限等待）。"""
         self.wait(self.WORKER_WAIT_MS)
+
+    def stop(self):
+        """一次性：广播 + 等待。单个线程自己停时用（测试 / 兼容旧调用）。"""
+        self.request_stop()
+        self.join_stop()
 
     def run(self):
         """QThread 里冒出去的异常不一定走 sys.excepthook，自己兜一层落盘。
@@ -1567,26 +1610,27 @@ class Fetcher(QThread):
                 fast = self.fast
                 source = self.source
 
-            # 自选股 + 大盘指数合成**一次**请求：每轮从 2 组 HTTP 降到 1 组，
-            # 少一个故障点，source / fallback 行为也一致。
-            # 自选删空了照样只请求指数；show_index 关掉就不带指数。
-            want = list(dict.fromkeys(codes + (INDEX_CODES if show_index else [])))
-            got, err = [], ""
-            if want:
+            # ★ 股票和指数**分开**取（方案 B）：股票一拿到就 emit，指数后补。
+            #
+            # 以前合成一次请求（codes + INDEX_CODES）：ProviderChain 支持
+            # partial fill，所以"腾讯给了 A/B/C、独缺 I3，再拿 I3 去问新浪"
+            # 这一步会把**整批**卡住 —— 股价明明已经拿到了，却要等指数的
+            # fallback 走完（最坏 5 秒）才进 UI。
+            # 辅助数据不该阻塞核心报价。代价是多一组 HTTP，对最多 5 只票
+            # 的小工具，稳定性优先于少一次请求。
+            rows, err = [], ""
+            if codes:
                 try:
-                    got = providers.fetch_quotes(want, prefer=source)
+                    rows = providers.fetch_quotes(codes, prefer=source)
                 except Exception as e:
-                    got, err = [], str(e)
+                    rows, err = [], str(e)
+            by_full = {r.get("full"): r for r in (rows or [])}
+            rows = [by_full[c] for c in codes if c in by_full]
 
-            # 每做完一次网络调用就看一眼：这一轮最长能把两个源的超时都走完（10 秒），
-            # 退出时不该等它把指数也一并拉完才返回。
-            if self._stop:
-                return
-
-            if want:
+            if codes:
                 t_cycle = time.time() - t_start
                 self._cycles += 1
-                if err or not got:
+                if err or not rows:
                     self._fail_count += 1
                     self.failed.emit(err or "未取到行情")
                     err = err or "未取到行情"
@@ -1597,14 +1641,11 @@ class Fetcher(QThread):
                 # 慢轮次单独记一笔：正常一轮 1 秒上下，慢了说明接口/网络有问题
                 if t_cycle > RUN_SLOW_SEC:
                     write_run_log("SLOW     本轮取数 %.1f 秒（源=%s，%d 只）"
-                                  % (t_cycle, source, len(want)))
+                                  % (t_cycle, source, len(codes)))
 
-            by_full = {r.get("full"): r for r in got}
-            rows = [by_full[c] for c in codes if c in by_full]
-            idx = ([by_full[c] for c in INDEX_CODES if c in by_full]
-                   if show_index else [])
-
-            if want:
+            # ---- 第一段 emit：核心报价先到先显示 ----
+            # idx 传 None = "这一批还没取指数，UI 保持原来那几行别动"。
+            if codes or show_index:
                 self.data_ready.emit({
                     "generation": generation,
                     "rows": rows,
@@ -1612,8 +1653,32 @@ class Fetcher(QThread):
                     # 否则指数成功会把"股票行情失败"这个错误状态擦掉（P1）。
                     "rows_ok": bool(rows) or not codes,
                     "rows_error": "" if rows else err,
+                    "idx": None,
+                    "idx_ok": None,
+                })
+
+            # 每做完一次网络调用就看一眼：退出时不等指数那一步（它可能卡满超时）
+            if self._stop:
+                return
+
+            # ---- 第二段：大盘指数（辅助数据，成败都不该影响已进 UI 的股价）----
+            if show_index:
+                idx, idx_err = [], ""
+                try:
+                    idx = providers.fetch_quotes(INDEX_CODES, prefer=source)
+                except Exception as e:
+                    idx, idx_err = [], str(e)
+                by_idx = {r.get("full"): r for r in (idx or [])}
+                idx = [by_idx[c] for c in INDEX_CODES if c in by_idx]
+                if self._stop:
+                    return
+                self.data_ready.emit({
+                    "generation": generation,
+                    "rows": rows,
+                    "rows_ok": bool(rows) or not codes,
+                    "rows_error": "" if rows else err,
                     "idx": idx,
-                    "idx_ok": bool(idx) or not show_index,
+                    "idx_ok": bool(idx),
                 })
 
             if time.time() - self._last_beat >= HEARTBEAT_SEC:
@@ -1674,7 +1739,9 @@ class SparkFetcher(QThread):
         self._source = "auto"
         self._enabled = True
         self._spark_cache = {}      # full -> {"ts","source","generation","pts"}
-        self._failed = {}           # full -> 上次失败的时刻
+        # (full, source, generation) -> 上次失败的时刻。
+        # ★ key 带身份：切源后旧源残留的冷却期不该套到新源头上。
+        self._failed = {}
 
     # ---- 外部只通过 setter 改状态 ----
     # 注意：generation **不由这里生成** —— 它必须和 Fetcher / Ticker 的
@@ -1721,10 +1788,19 @@ class SparkFetcher(QThread):
             self._source = source
         self._wake.set()
 
-    def stop(self):
+    def request_stop(self):
+        """只广播停止意图：**设标志 + 唤醒**，绝不等待（见 Fetcher.request_stop）。"""
         self._stop = True
         self._wake.set()      # 唤醒它，让它立刻看到停止标志，别睡满 0.5 秒
+
+    def join_stop(self):
+        """等它真正退出（有界）。"""
         self.wait(self.WORKER_WAIT_MS)
+
+    def stop(self):
+        """一次性：广播 + 等待。"""
+        self.request_stop()
+        self.join_stop()
 
     def run(self):
         try:
@@ -1752,7 +1828,7 @@ class SparkFetcher(QThread):
                 if self._stop:          # 退出时别再一只只慢慢拉
                     return
                 pts = self._cached(full, source, generation)
-                if pts is None and self._in_backoff(full):
+                if pts is None and self._in_backoff(full, source, generation):
                     continue            # 刚失败过，这轮别再打网络
                 if pts is None:
                     pts = self._spark(full, source, generation)
@@ -1775,8 +1851,26 @@ class SparkFetcher(QThread):
             return entry.get("pts")
         return None
 
-    def _in_backoff(self, full):
-        return (time.time() - self._failed.get(full, 0)) < self.FAIL_BACKOFF
+    def _in_backoff(self, full, source, generation):
+        """这只**在当前身份下**最近失败过吗？
+
+        ★ key 必须带 (source, generation)：如果只按代码记，旧身份失败留下的
+        backoff 会被新身份命中 —— 用户切完源，价格已经换成新源的了，分时却要
+        空等最多 45 秒才重新请求（旧请求把自己的失败写进了新身份的冷却期）。
+        """
+        return (time.time() - self._failed.get((full, source, generation), 0)) \
+            < self.FAIL_BACKOFF
+
+    def _identity_is_current(self, source, generation):
+        """(source, generation) 还是当前身份吗？**每次都重新读真实状态**。
+
+        ★ 绝不能拍快照：网络请求期间用户可能切源 / 换自选股。一旦把
+        self._generation / self._source 抄进局部变量，请求回来时的比对就退化成
+        "旧参数比旧快照" —— 恒等，身份早就变了却永远检测不到，于是旧结果照样
+        写回 _failed / _spark_cache。所以网络前、网络后、真正写之前，都要重新读。
+        """
+        with self._state_lock:
+            return (generation == self._generation and source == self._source)
 
     def _spark(self, full, source, generation):
         """拉一只的分时。
@@ -1785,34 +1879,45 @@ class SparkFetcher(QThread):
         旧请求在途时用户切了源，它回来之后会把旧源结果写回缓存；
         新源下一轮读到直接命中 —— 价格是新源的，走势却是旧源画的。
 
-        两道保险：
+        三道保险：
           1) entry 带身份，旧身份的永远不会被新身份命中
-          2) 网络返回后、写缓存之前，重新确认身份没变
+          2) 网络前、网络后都**重新读**当前身份（不是请求前拍的快照）
+          3) 真正写 _spark_cache / _failed 时在锁内再确认一次
         """
         if not full:
             return None
         hit = self._cached(full, source, generation)
         if hit is not None:
             return hit                  # 没过期就不联网
+        # 排队 / TTL 判定的这段时间里身份也可能变了，发请求之前先确认一次
+        if not self._identity_is_current(source, generation):
+            return None
         now = time.time()
-        with self._state_lock:
-            current_gen = self._generation
-            current_src = self._source
         try:
             raw = providers.fetch_spark(full, prefer=source)
             got = raw if (raw and len(raw) >= 2) else None
         except Exception:
             got = None
-        # 网络回来了，世界可能已经变了。从那一刻起旧结果就不属于当前身份。
-        if generation != current_gen or source != current_src:
+        # 网络回来了，世界可能已经变了 —— 重新读**当前**身份，
+        # 不能拿请求前拍下的局部变量来比（那样永远是恒等，等于没验）。
+        if not self._identity_is_current(source, generation):
             return None
         if got:
-            self._spark_cache[full] = {"ts": now, "source": source,
-                                       "generation": generation, "pts": got}
-            self._failed.pop(full, None)
+            with self._state_lock:
+                if not (generation == self._generation
+                        and source == self._source):
+                    return None
+                self._spark_cache[full] = {"ts": now, "source": source,
+                                           "generation": generation, "pts": got}
+                self._failed.pop((full, source, generation), None)
             return got
         # 两个源都没给 -> 记一笔，避免每个报价周期都重试（这就是 P0 的放大器）
-        self._failed[full] = now
+        # ★ key 带身份：旧身份的失败不该把新身份也一起拖进 45 秒冷却
+        with self._state_lock:
+            if not (generation == self._generation
+                    and source == self._source):
+                return None
+            self._failed[(full, source, generation)] = now
         entry = self._entry(full, source, generation)
         return (entry or {}).get("pts")     # 这轮先用上次的（同身份）
 
@@ -1824,6 +1929,7 @@ class Searcher(QThread):
     UI 靠 seq 丢弃先发的旧结果 —— 否则"输 mao 再改 pingan"最后会显示 mao。
     """
     result_ready = Signal(str, int, list)
+    fatal = Signal(str)
     # 同上：最坏要把两个源都试一遍（5+5 秒），6500 已经盖不住了
     WORKER_WAIT_MS = (providers.HTTP_TIMEOUT * 1000 * len(providers.PROVIDERS)
                       + 2000)
@@ -1848,15 +1954,38 @@ class Searcher(QThread):
         with self._lock:
             self.source = key or "auto"
 
-    def stop(self):
+    def request_stop(self):
+        """只广播停止意图：**设标志 + 唤醒**，绝不等待。
+
+        ★ 退出时三个 worker 必须**先全部收到信号，再统一 wait**。
+        如果串行 stop()（设 A → 等 A → 设 B → 等 B → ...），三个都卡在网络里时
+        实际是"等 A 超时 → 才轮到通知 B → 等 B 超时 → ..."，最坏退出时间变成
+        三个 timeout 相加。拆成广播 + 统一 wait 后，三者同时开始收敛，
+        总耗时约等于最慢的那一个。
+        """
         self._stop = True
+        wake = getattr(self, "_wake", None)
+        if wake is not None:
+            wake.set()      # 唤醒它，让它立刻看到标志，别睡满等待间隔
+
+    def join_stop(self):
+        """等它真正退出（有界，不会把退出拖成无限等待）。"""
         self.wait(self.WORKER_WAIT_MS)
 
+    def stop(self):
+        """一次性：广播 + 等待。单个线程自己停时用（测试 / 兼容旧调用）。"""
+        self.request_stop()
+        self.join_stop()
+
     def run(self):
+        # 和 Fetcher / SparkFetcher 保持一致：异常不能只落盘就了事。
+        # 只落盘的话用户看到的是"价格照常刷新，搜索框却永远搜不出东西"，
+        # 没有任何提示，也不知道去看日志。所以要 emit fatal 让 UI 明说。
         try:
             self._loop()
         except Exception:
             write_crash_log(_crash_text(*sys.exc_info()))
+            self.fatal.emit("搜索线程异常停止")
 
     def _loop(self):
         while not self._stop:
@@ -2131,6 +2260,9 @@ class Ticker(QWidget):
         self.searcher = Searcher()
         self.searcher.set_source(self.cfg.get("data_source") or "auto")
         self.searcher.result_ready.connect(self.on_search_result)
+        # 搜索线程以前是唯一"死了也不吭声"的 worker：静默退出后价格照常刷新，
+        # 只有搜索框永远搜不出东西，用户无从判断。现在和前两个一视同仁。
+        self.searcher.fatal.connect(self._on_worker_fatal)
         self.searcher.start()
 
         self.search_timer = QTimer(self)
@@ -2323,16 +2455,22 @@ class Ticker(QWidget):
             return
 
         rows = data.get("rows") or []
-        idx = data.get("idx") or []
+        # ★ idx 为 None 表示"这一批还没取指数"（方案 B 的第一段 emit），
+        # 要保持原来那几行指数，不能把它清成空 —— 否则股价一刷新，
+        # 顶部大盘先空白一下，等指数回来再填上，看着像闪。
+        idx = data.get("idx")
         rows_ok = data.get("rows_ok", bool(rows))
         rows_error = data.get("rows_error") or ""
-        idx_ok = data.get("idx_ok", bool(idx))
+        idx_ok = data.get("idx_ok")
+        if idx_ok is None:
+            idx_ok = bool(idx)      # 兼容老调用：没显式给就按有没有数据推断
 
         # ★ 界面的行由**配置里的自选**决定，不是"接口这次返回了几只"（P1）。
         # 否则某只股票两个源都没有时，窗口会直接从 5 行缩成 4 行 —— 用户分不清
         # 是自己删了、还是行情源没数据、还是代码错了。缺的那只留一个占位行。
         self.rows = self._with_placeholders(rows)
-        self.indices = idx
+        if idx is not None:
+            self.indices = idx
 
         # ★ 指数成功不能把"股票行情失败"的错误状态擦掉（P1）。
         # 以前是 `if rows or idx: self.err = ""` —— 只要这一批里有一种数据就算成功，
@@ -2342,6 +2480,12 @@ class Ticker(QWidget):
         else:
             self.err = ""
             self.updated_at = market_clock.market_now().strftime("%H:%M:%S")
+            # ★ 部分缺失也要让用户看见：配了 5 只只回来 1 只时 bool(rows) 依然是
+            # 真，于是 footer 显示"刚更新"，看着像完全成功，其实另外 4 只都是
+            # 占位行。不弹窗，只在 footer 轻提示一行（P2）。
+            _miss = sum(1 for r in self.rows if r.get(ROW_UNAVAILABLE))
+            if _miss:
+                self.err = "行情部分缺失 %d/%d" % (_miss, len(self.rows))
         if idx_ok:
             self.idx_updated_at = market_clock.market_now().strftime("%H:%M:%S")
 
@@ -2900,6 +3044,12 @@ class Ticker(QWidget):
 
         pct = r["pct"]
         missing = bool(r.get(ROW_UNAVAILABLE))
+        # ★ 行情自己的时间戳太老 → 整行视觉降级（降透明度 + 标一个"旧"）。
+        # 占位行本来就没有价格，不用再标。
+        stale = (not missing and (_quote_age_sec(r) or 0) > STALE_SEC)
+        if stale:
+            p.save()
+            p.setOpacity(0.45)
         color = (self._up() if pct > 0
                  else (self._down() if pct < 0 else self._flat()))
 
@@ -2949,6 +3099,10 @@ class Ticker(QWidget):
         fm = QFontMetrics(QFont("Microsoft YaHei", 9, QFont.Bold))
         nx = 14 + ox + fm.horizontalAdvance(name) + 6
         self._text(p, QRect(nx, y + 7, 60, 16), Qt.AlignVCenter | Qt.AlignLeft, r["code"], self._fg_fade())
+        if stale:
+            # 和"备源补位"那个小字同理：正常时一个字都不画，只有真旧了才说
+            self._text(p, QRect(nx + 44, y + 7, 22, 16),
+                       Qt.AlignVCenter | Qt.AlignLeft, "旧", self._fg_fade())
 
         # 这行不是期望的源给的 → 代码后面跟一个灰色小字。正常时一个字都不画：
         # 满屏都是同一个源名是噪音，不是信息；只有"主源没给全、备源补的"才值得说。
@@ -3015,6 +3169,9 @@ class Ticker(QWidget):
             pts = r.get("spark")
             if pts and len(pts) > 2:
                 self._spark(p, pts, w - 14 - 62, y + 24, 62, 18, color, r["prev"])
+
+        if stale:
+            p.restore()      # 把透明度还原，别影响后面几行的绘制
 
     def _draw_checkbox(self, p, x, y, checked):
         """多选模式左侧的复选框"""
@@ -3824,11 +3981,21 @@ class Ticker(QWidget):
             self.toggle_boss()
 
     def update_tray_tip(self):
+        # ★ 不能一进来就 `if not self.rows: return` —— 用户把自选股清空后，
+        # 托盘的图标和 tooltip 会一直挂着上一次的股票，看着像还在盯盘。
+        # 空列表要主动 reset 成默认。
         if not self.rows:
+            self.tray.setToolTip("A股盯盘")
+            self.tray.setIcon(make_trend_icon("flat"))
             return
         positions = self.cfg.get("positions") or {}
         lines = []
         for r in self.rows:
+            if r.get(ROW_UNAVAILABLE):
+                # 占位行没有价格。拼成 "暂无数据 0.00 +0.00%" 会被读成
+                # "价格真的是 0"，那是个错误的结论 —— 明确写"数据暂不可用"。
+                lines.append("%s  数据暂不可用" % (r.get("code") or ""))
+                continue
             line = "%s %.*f  %s%.2f%%" % (
                 r["name"], r.get("decimals", 2), r["price"],
                 "+" if r["pct"] > 0 else "", r["pct"])
@@ -3847,9 +4014,14 @@ class Ticker(QWidget):
         self.tray.setToolTip("A股盯盘\n" + "\n".join(lines))
 
     def update_tray_icon(self):
-        if not self.rows:
+        # 同上：空列表要 reset，不能留着上一批的颜色。
+        # 而且占位行的 pct 是 0，把它们算进均值会把真实的涨跌拉平 ——
+        # 5 只里 4 只没数据、1 只 +5% 时，图标不该显示成"平"。
+        valid = [r for r in self.rows if not r.get(ROW_UNAVAILABLE)]
+        if not valid:
+            self.tray.setIcon(make_trend_icon("flat"))
             return
-        avg = sum(r["pct"] for r in self.rows) / len(self.rows)
+        avg = sum(r["pct"] for r in valid) / len(valid)
         self.tray.setIcon(make_trend_icon(trend_kind(avg)))
 
     def clear_forced_festivals(self):
@@ -3877,11 +4049,18 @@ class Ticker(QWidget):
         _app = QApplication.instance()
         if _app is not None:
             _app.removeEventFilter(self)
-        self.fetcher.stop()
+        # ★ 先广播、再统一等：三个 worker 同时收到停止信号、同时开始收敛。
+        # 直接串行 stop() 的话是"等第一个超时了才去通知第二个"，三者都卡在
+        # 网络里时最坏退出时间是三个 timeout 相加。
+        workers = [self.fetcher]
         if hasattr(self, "sparker"):
-            self.sparker.stop()
+            workers.append(self.sparker)
         if hasattr(self, "searcher"):
-            self.searcher.stop()
+            workers.append(self.searcher)
+        for w in workers:
+            w.request_stop()      # 只设标志 + 唤醒，不等待
+        for w in workers:
+            w.join_stop()         # 全部通知完了再一起等
         self.tray.hide()
         QApplication.quit()
 

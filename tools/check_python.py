@@ -121,7 +121,14 @@ def main(argv=None):
             print("找不到受支持的 Python（需要 %d.%d - %d.%d）"
                   % (MIN_PY + MAX_PY), file=sys.stderr)
             return 1
-        print(" ".join(cmd))
+        # ★ Windows 上路径常带空格（C:\Program Files\Python313\python.exe），
+        # " ".join 拼出来没有引号，install.bat 里 `%PYCMD% -m venv` 会被 cmd
+        # 拆成两个 token，venv 根本建不起来。list2cmdline 才是 Windows 上把
+        # argv 拼回命令行的正确方式（按需加引号，没空格就不加）。
+        if os.name == "nt":
+            print(subprocess.list2cmdline(cmd))
+        else:
+            print(" ".join(cmd))
         return 0
 
     target = argv[0] if argv else None

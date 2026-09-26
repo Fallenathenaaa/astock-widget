@@ -145,6 +145,40 @@ for name in ("install.bat", "start.bat"):
     if name == "install.bat":
         chk("install.bat 用 --range 填提示", "--range" in txt)
 
+print("== portable 启动分支必须先做可见预检 ==")
+# 报告 P2-13：只要 py\pythonw.exe 存在就直接 pythonw 启动。包损坏 / 缺 DLL /
+# _pth 写错时 pythonw 静默退出，而多数 import 发生在崩溃处理器安装之前 ——
+# 连 crash log 都不会有，用户只看到"双击没反应"。所以必须先用控制台 python
+# 预检一遍，失败要给看得见的错误 + 非零退出，而不是继续静默拉起 pythonw。
+# （这里做静态断言：真跑 start.bat 会撞上 pause 把测试挂住。）
+_ptxt = io.open(os.path.join(ROOT, "start.bat"), encoding="utf-8").read()
+chk("便携分支用带控制台的 python 做预检",
+    'py\\python.exe" -c "import PySide6' in _ptxt)
+chk("预检覆盖 providers / market_clock（不只是 PySide6）",
+    "providers, market_clock" in _ptxt)
+chk("预检失败给可见错误", "ERROR" in _ptxt)
+chk("预检失败非零退出，不再静默启动", "exit /b 1" in _ptxt)
+chk("预检失败会 pause（窗口不会一闪而过）", "pause" in _ptxt)
+_i_pre = _ptxt.index('py\\python.exe" -c')
+_i_launch = _ptxt.index('start "" "%~dp0py\\pythonw.exe"')
+chk("预检在启动之前", _i_pre < _i_launch, (_i_pre, _i_launch))
+
+print("== --find 的输出要能直接当命令用（带空格的路径得有引号）==")
+# install.bat 是 `%PYCMD% -m venv "%VENV%"`，拿 --find 的输出原样当命令跑。
+# 解释器装在 C:\Program Files\Python313\ 时，裸 " ".join 出来的没有引号，
+# cmd 会把它拆成两个 token，venv 建不起来。
+s_spaced = subprocess.list2cmdline([r"C:\Program Files\Python313\python.exe"])
+chk("带空格的路径被加上引号", s_spaced.startswith('"'), s_spaced)
+chk("不带空格的路径不多加引号",
+    subprocess.list2cmdline([r"C:\Python313\python.exe"])
+    == r"C:\Python313\python.exe")
+chk("py -3.13 这种拼出来不变",
+    subprocess.list2cmdline(["py", "-3.13"]) == "py -3.13")
+if os.name == "nt":
+    _src = io.open(HELPER, encoding="utf-8").read()
+    chk("helper 在 Windows 上用 list2cmdline 拼（不是裸 join）",
+        "subprocess.list2cmdline(cmd)" in _src)
+
 print()
 print("%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

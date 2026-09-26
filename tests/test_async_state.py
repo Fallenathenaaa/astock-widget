@@ -385,6 +385,12 @@ _real_spark = W.providers.fetch_spark
 calls = []
 f = W.SparkFetcher()
 f.set_codes(["sh600519"])
+# ★ 关键：让对象内部身份与下面 _spark() 传入的身份**真正一致**。
+# 以前这里只 set_codes 不 set_source，内部 _source 还是构造默认的 "auto"，
+# 却把 "tencent" 传进 _spark() —— 参数与状态一开始就不一致，于是
+# "切源后旧结果被丢弃"这条**不用切源也会成立**，测试根本没走到
+# "请求开始时身份一致、网络途中才发生切换"的目标竞态。CI 全绿是假安全感。
+f.set_source("tencent")
 gen_t = f._generation
 
 
@@ -473,6 +479,7 @@ def race_fill(bump, label, src_old, src_new):
     """bump: 让身份变化的那个动作（set_source / set_codes）。"""
     fx = W.SparkFetcher()
     fx.set_codes(["sh600519"])
+    fx.set_source(src_old)      # ★ 同上：内部身份必须与请求身份一致
     g_old = fx._generation
     seen = []
 
@@ -518,6 +525,72 @@ race_fill(lambda fx: fx.set_source("sina", fx._generation + 1), "切源",
           "tencent", "sina")
 race_fill(lambda fx: fx.set_codes(["sh600519"], fx._generation + 1), "换自选",
           "auto", "auto")
+
+
+print("== 旧身份失败的 spark，不许把新身份拖进 45 秒冷却 ==")
+# 报告 P1 里"现在没有覆盖"的那一条：旧请求在途时切源，旧请求回来**失败**。
+# 若 _failed 只按代码记（不带身份），旧身份的失败会写进新身份的冷却期 ——
+# 用户表现是：切完源价格已经换成新源了，分时却要空等最多 45 秒才重新请求。
+fb = W.SparkFetcher()
+fb.set_codes(["sh600519"])
+fb.set_source("tencent")            # 内部身份 = 旧请求身份（必须一致）
+g_old = fb._generation
+
+_blk2 = []
+
+
+def fake_fail(full, prefer="auto"):
+    if not _blk2:                   # 只卡住第一通（旧身份的）
+        _blk2.append(1)
+        started2.set()
+        release2.wait(5)
+    return None                     # 两个源都没给 -> 失败
+
+
+started2, release2 = threading.Event(), threading.Event()
+W.providers.fetch_spark = fake_fail
+t2 = threading.Thread(
+    target=lambda: fb._spark("sh600519", "tencent", g_old))
+t2.start()
+try:
+    chk("旧身份请求卡进网络", started2.wait(5))
+    g_new = fb.set_source("sina", g_old + 1)     # 切源：清缓存 + 清 failed
+    release2.set()
+    t2.join(5)
+
+    # 旧请求回来发现身份已变 -> 必须整个丢弃，连失败都不许记
+    chk("旧身份失败根本没被记进 _failed",
+        ("sh600519", "tencent", g_old) not in fb._failed, dict(fb._failed))
+    # 新身份不得处于冷却期
+    chk("旧身份失败没有污染新身份的冷却期",
+        not fb._in_backoff("sh600519", "sina", g_new), dict(fb._failed))
+
+    seen2 = []
+
+    def fake_ok(full, prefer="auto"):
+        seen2.append((full, prefer))
+        return [20.0, 20.5]
+
+    W.providers.fetch_spark = fake_ok
+    pts2 = fb._spark("sh600519", "sina", g_new)
+    chk("新身份当轮立即真请求（没被 backoff 跳过）", seen2 != [], seen2)
+    chk("新身份当轮就拿到分时", pts2 == [20.0, 20.5], pts2)
+finally:
+    release2.set()
+    t2.join(5)
+    fb._stop = True
+    W.providers.fetch_spark = _real_spark
+
+print("== 失败冷却期必须带身份（不依赖网络时序的独立断言）==")
+# 上面那条靠"旧请求整个被丢弃"来保证不污染；这条单独钉死 _failed 的 key 结构
+# —— 万一将来哪次重构让旧身份的失败写进去了，只要 key 带身份，新身份也伤不到。
+fbb = W.SparkFetcher()
+fbb.set_codes(["sh600519"])
+fbb._failed[("sh600519", "tencent", 1)] = time.time()    # 旧身份刚失败过
+chk("旧身份的失败不会命中新身份",
+    not fbb._in_backoff("sh600519", "sina", 2), dict(fbb._failed))
+chk("同一身份自己的失败仍然生效",
+    fbb._in_backoff("sh600519", "tencent", 1), dict(fbb._failed))
 
 
 print("== P0：spark 卡死，不许挡住核心报价 ==")
@@ -632,6 +705,168 @@ chk("stop 是有界的", cost < budget, (cost, budget))
 chk("两个线程都停了", not fz.isRunning() and not sz.isRunning())
 W.providers.fetch_quotes = _real_quotes
 W.providers.fetch_spark = _real_spark_fn
+
+print("== 退出：三个 worker 先广播停止，再统一等 ==")
+# 报告 P1：串行 stop() 是"设 A → 等 A 超时 → 才设 B → 等 B 超时 → 才设 C"，
+# 三者都卡在网络里时最坏退出时间是三个 WORKER_WAIT_MS 相加。
+# 拆成 request_stop()（只广播，不等待）+ join_stop()（统一等）之后，
+# 三个线程同时收到信号、同时开始收敛，总耗时约等于最慢的那一个。
+fq2, fs2, fse2 = W.Fetcher(), W.SparkFetcher(), W.Searcher()
+fq2.set_codes(["sh600519"])
+for _w in (fq2, fs2, fse2):
+    QThread.start(_w)                  # 真跑起来
+time.sleep(0.4)
+t0 = time.time()
+for _w in (fq2, fs2, fse2):
+    _w.request_stop()                  # 只广播，不等待
+broadcast = time.time() - t0
+chk("request_stop 只广播不等待（几乎不耗时）", broadcast < 0.5, broadcast)
+chk("广播后三个 worker 全都看到了停止信号",
+    all(_w._stop for _w in (fq2, fs2, fse2)),
+    [_w._stop for _w in (fq2, fs2, fse2)])
+for _w in (fq2, fs2, fse2):
+    _w.join_stop()                     # 全部通知完了再一起等
+joined = time.time() - t0
+chk("三个都停了", all(not _w.isRunning() for _w in (fq2, fs2, fse2)))
+one_budget = max(W.Fetcher.WORKER_WAIT_MS, W.SparkFetcher.WORKER_WAIT_MS,
+                 W.Searcher.WORKER_WAIT_MS) / 1000.0 + 2
+sum_budget = (W.Fetcher.WORKER_WAIT_MS + W.SparkFetcher.WORKER_WAIT_MS
+              + W.Searcher.WORKER_WAIT_MS) / 1000.0 + 2
+chk("退出耗时约等于一个最慢的 worker，不是三个相加",
+    joined < one_budget, (joined, one_budget, sum_budget))
+
+print("== 部分缺失不能算完全成功 ==")
+# 报告 P2-10：rows_ok = bool(rows) or not codes，配 5 只只回来 1 只也是 True，
+# 于是 footer 显示"刚更新"、错误提示为空，看着像完全成功 —— 其实另外 4 只
+# 全是占位行。不弹窗，只在 footer 轻提示。
+w2 = W.Ticker(copy.deepcopy(W.DEFAULT_CONFIG))
+w2.cfg["codes"] = ["sh600519", "sz000001", "sz300750", "sh601318", "sh600036"]
+_gen2 = w2.watchlist_generation
+
+
+def _feed(rows_list):
+    w2.on_data({"generation": _gen2, "rows": rows_list,
+                "rows_ok": True, "rows_error": "",
+                "idx": [], "idx_ok": True})
+
+
+_feed([row("sh600519", "600519", "贵州茅台")])
+chk("只回来 1 只时不再假装完全成功", "部分缺失" in (w2.err or ""), w2.err)
+chk("缺失数量写明是 4/5", "4/5" in (w2.err or ""), w2.err)
+_feed([row(c, c[2:], "n") for c in w2.cfg["codes"]])
+chk("全部拿到时不报缺失", w2.err == "", w2.err)
+
+print("== 托盘：占位行别显示成 0，清空后要 reset ==")
+# 报告 P2-11：update_tray_tip 没检查 ROW_UNAVAILABLE，占位行会显示成
+# "暂无数据 0.00 +0.00%"，读起来像价格真的是 0；而且 `if not self.rows: return`
+# 意味着用户清空自选股后，托盘仍挂着上一次的股票状态。
+w3 = W.Ticker(copy.deepcopy(W.DEFAULT_CONFIG))
+w3.cfg["codes"] = ["sh600519", "sz000001"]
+w3.on_data({"generation": w3.watchlist_generation,
+            "rows": [row("sh600519", "600519", "贵州茅台", pct=3.0)],
+            "rows_ok": True, "rows_error": "", "idx": [], "idx_ok": True})
+_tip = w3.tray.toolTip()
+chk("缺的那只在托盘里写明数据暂不可用", "数据暂不可用" in _tip, _tip)
+chk("占位行不再显示成 0.00（那像价格真是 0）",
+    "暂无数据 0.00" not in _tip, _tip)
+w3.rows = []
+w3.update_tray_tip()
+chk("清空自选股后 tooltip 被 reset（不留着上次的股票）",
+    w3.tray.toolTip() == "A股盯盘", w3.tray.toolTip())
+w3.update_tray_icon()      # 空列表时图标也要能 reset，不能抛异常
+chk("空列表时图标 reset 不报错", True)
+
+print("== 旧行情要认得出来（看行情自己的时间戳）==")
+# 报告 P1-8：footer 显示的是"程序什么时候收到这一批"，不是行情自己的时间。
+# 10:20 的数据 10:30 才送到，界面看着像刚更新 —— 所以要能算出 age 并判定"旧"。
+_now = market_clock.market_now()
+_fresh = {"time": _now.strftime("%Y%m%d%H%M%S")}
+_old = {"time": (_now - timedelta(seconds=200)).strftime("%Y%m%d%H%M%S")}
+chk("刚到的行情 age 很小", (W._quote_age_sec(_fresh) or 999) <= 5,
+    W._quote_age_sec(_fresh))
+chk("200 秒前的行情超过 stale 阈值",
+    (W._quote_age_sec(_old) or 0) > W.STALE_SEC, W._quote_age_sec(_old))
+chk("认不出来的时间戳返回 None",
+    W._quote_age_sec({"time": ""}) is None and W._quote_age_sec({}) is None)
+chk("stale 阈值是 120 秒", W.STALE_SEC == 120, W.STALE_SEC)
+
+print("== 指数卡住，不许拖住已经拿到的股价（方案 B）==")
+# 报告第 4 节：以前股票和指数合成一次请求，ProviderChain 的 partial fill 会让
+# "腾讯给了股票、独缺 I3，再拿 I3 去问新浪"这一步卡住整批 —— 股价明明在手，
+# 却要等指数 fallback 走完（最坏 5 秒）才 emit。
+_ix_entered, _ix_release = threading.Event(), threading.Event()
+_ix_blocked = []
+_ix_done = []
+_stock_rows = []
+_stock_emit = threading.Event()
+
+
+def fake_quotes_split(codes, prefer="auto"):
+    """股票立即返回；指数永久卡住，直到测试主动释放。"""
+    if codes and all(c in W.INDEX_CODES for c in codes):
+        if not _ix_blocked:
+            _ix_blocked.append(1)
+            _ix_entered.set()
+            _ix_release.wait(30)
+        _ix_done.append(1)
+        return []
+    return [P.make_quote(c, c[2:], "测试", "11.0", "10.0", volume=100)
+            for c in codes]
+
+
+W.providers.fetch_quotes = fake_quotes_split
+fx2 = W.Fetcher()
+fx2.set_codes(["sh600519"])
+fx2.show_index = True
+
+
+def _on_split(d):
+    # 第一段 emit：idx 是 None（指数还没取），但 rows 必须已经有股价
+    if d.get("idx") is None and d.get("rows"):
+        _stock_rows.append(list(d["rows"]))
+        _stock_emit.set()
+
+
+fx2.data_ready.connect(_on_split)
+QThread.start(fx2)
+try:
+    # 子线程 emit 的 signal 要主线程跑事件循环才会投递过来，
+    # 而这个测试没进 app.exec()，所以得自己转一会儿事件循环。
+    _t0 = time.time()
+    while time.time() - _t0 < 8 and not _stock_emit.is_set():
+        app.processEvents()
+        time.sleep(0.05)
+    chk("指数还在卡着的时候，股价就已经 emit 了",
+        _stock_emit.is_set(), "没等到股票 emit")
+    chk("emit 的确实是股票数据", bool(_stock_rows and _stock_rows[0]),
+        _stock_rows[:1])
+    chk("此刻指数请求确实还没返回（就是它卡着）",
+        _ix_entered.is_set() and not _ix_done,
+        (_ix_entered.is_set(), _ix_done))
+finally:
+    _ix_release.set()
+    fx2.request_stop()
+    fx2.join_stop()
+    W.providers.fetch_quotes = _real_quotes
+
+print("== Searcher 死了也要吭声（不能只落盘）==")
+# 报告 P2-12：Fetcher / SparkFetcher 都会 emit fatal 让 UI 明说，
+# Searcher 以前是唯一静默退出的 —— 用户看到"价格照常刷新，搜索框却永远
+# 搜不出东西"，没有任何提示，也不知道该去看日志。
+_se = W.Searcher()
+_fatal_seen = []
+_se.fatal.connect(lambda m: _fatal_seen.append(m))
+
+
+def _boom():
+    raise RuntimeError("搜索线程自己炸了")
+
+
+_se._loop = _boom
+_se.run()                      # 直接调 run()，异常应被兜住并 emit fatal
+chk("Searcher 异常时 emit fatal（不是静默退出）",
+    _fatal_seen == ["搜索线程异常停止"], _fatal_seen)
+chk("Searcher 真的有 fatal 信号", hasattr(W.Searcher, "fatal"))
 
 print()
 print("%d passed, %d failed" % (ok, fail))
