@@ -34,6 +34,44 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
 
 GREEN, RED, DIM = "\033[92m", "\033[91m", "\033[90m"
+YELLOW = "\033[93m"
+
+
+def remote_tag_sha(tag):
+    """查远端这个 tag 指向哪个 commit。
+
+    返回三种东西：
+      "missing" —— 远端没这个 tag（新版本，还没发过）
+      "unknown" —— 查不到（网络问题 / API 抽风），不该因此挡住发版
+      一串 sha   —— tag 指向的 commit
+    """
+    try:
+        import json, urllib.request, urllib.error
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        from push_github import OWNER, REPO      # 只取常量，不碰它的网络封装
+        # ★ 这里故意**不带** Authorization：push_github.http 在无 token 时会
+        # 发一个空 Bearer 头，GitHub 回 401 Bad credentials（真踩过）。
+        # 仓库是公开的，匿名查 tag 就够了；也免得给 CI 配额外的 token。
+        url = ("https://api.github.com/repos/%s/%s/git/refs/tags/%s"
+               % (OWNER, REPO, tag))
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "astock-widget-release-check",
+            "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read())
+        obj = d.get("object") or {}
+        # ★ 附注标签（annotated tag）这里 type 是 "tag"，sha 指向 tag 对象
+        # 而不是 commit —— 拿它跟 GITHUB_SHA（一个 commit sha）比必然不等，
+        # 于是每次都误判成"版本分叉"。我们的 tag 都是 release_tag.py 用
+        # POST /git/refs 建的轻量标签（type=commit，实测过），但万一哪天换了
+        # 建法，宁可跳过也别误报 —— 跟"查不清就不挡"是同一个态度。
+        if obj.get("type") not in (None, "commit"):
+            return "unknown"
+        return obj.get("sha") or "unknown"
+    except urllib.error.HTTPError as e:
+        return "missing" if e.code == 404 else "unknown"
+    except Exception:
+        return "unknown"
 
 
 def read_version(root=ROOT):
@@ -108,6 +146,35 @@ def main():
     require("README 的下载链接指着 %s" % ver,
             bool(ver) and m_dl is not None and m_dl.group(1) == ver,
             m_dl.group(1) if m_dl else "没找到 releases/tag/ 链接")
+
+    # ------------------------------------------ 0.5 tag 身份（防版本分叉）
+    # 场景：v2.1.7 的 tag 已经发出去了，之后又往 main 推了新代码，但
+    # APP_VERSION 还写着 v2.1.7。于是 "v2.1.7" 这个版本号同时对应两份
+    # 不同的代码 —— 用户说"我用的 v2.1.7 有问题"时，根本不知道他拿的是哪份。
+    # 便携包还会更糟：它可能是从后来的 main 构建的，tag 里却没那份 start.bat。
+    #
+    # ★ 只在 CI 的 main push 上查，两个原因：
+    #   1) push_github.py 是在服务端**现建** commit 的，本地 sha 和远端天然
+    #      不同（同一份内容两个 sha），本地查必误报
+    #   2) PR 上 GITHUB_SHA 是合并提交，也不是 main 本人，同样会误报
+    is_main_push = (os.environ.get("GITHUB_EVENT_NAME") == "push"
+                    and os.environ.get("GITHUB_REF") == "refs/heads/main")
+    sha = os.environ.get("GITHUB_SHA") or ""
+    tag = tag_name(ver) if ver else ""
+    if not is_main_push or not sha or not tag:
+        print("%s[ -- ]%s 非 CI main push，跳过 tag 身份检查"
+              "（本地/PR 的 sha 与远端 tag 不可比，查了只会误报）" % (DIM, DIM))
+    else:
+        tc = remote_tag_sha(tag)
+        if tc == "missing":
+            ok_line("远端还没有 %s 这个 tag（新版本，可以直接发）" % tag)
+        elif tc == "unknown":
+            print("%s[WARN]%s 查不到远端 tag %s（网络问题？），跳过身份检查"
+                  % (YELLOW, DIM, tag))
+        else:
+            require("已发布的 %s 仍指着当前 commit" % tag, tc == sha,
+                    "tag 指着 %s，当前是 %s —— 版本号没变却已经继续开发了，"
+                    "先升 widget.py 里的 APP_VERSION" % (tc[:8], sha[:8]))
 
     # ------------------------------------------------------------ 1. 测试
     rc, out = run([PY, "run_tests.py"])

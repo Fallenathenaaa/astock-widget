@@ -13,9 +13,13 @@ tag（界面写着 v2.1.2、Release 挂着 v9.9.9）；建 tag 成功、建 Rele
 
 不发网络请求：http 整个换成假的实现。
 """
+import io
+import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -292,6 +296,43 @@ chk("tools/ 里没有 move_tag.py",
 rt_src = open(os.path.join(ROOT, "tools", "release_tag.py"), encoding="utf-8").read()
 chk("release_tag 里没有改 ref 的 PATCH（= 挪 tag）",
     "PATCH" not in rt_src, "出现了 PATCH")
+
+print("== tag 身份：查远端 tag 指着哪个 commit ==")
+# CI 上靠它判断"版本号没升却继续提交了代码"。三种返回值必须分清：
+#   missing = 没发过的新版本，直接放行
+#   unknown = 查不清，不挡发版（宁可放过也别误报）
+#   sha     = 拿去跟 GITHUB_SHA 比对
+# 混了会很难查：把 unknown 当成 sha 会让每次发版都被拦，把 missing 当成 sha
+# 又会让"已经发过还继续开发"这件事悄悄溜过去。
+def tag_lookup(payload=None, http_code=None, raises=None):
+    """把 urlopen 换成假的，跑一次 remote_tag_sha。不发网络请求。"""
+    def fake(req, timeout=None):
+        if raises is not None:
+            raise raises
+        if http_code is not None:
+            raise urllib.error.HTTPError("https://example.invalid",
+                                         http_code, "boom", None, None)
+        return io.BytesIO(json.dumps(payload or {}).encode("utf-8"))
+
+    old = urllib.request.urlopen
+    urllib.request.urlopen = fake
+    try:
+        return RC.remote_tag_sha("v9.9.9")
+    finally:
+        urllib.request.urlopen = old
+
+
+chk("404 → missing（没发过的新版本，不该拦）",
+    tag_lookup(http_code=404) == "missing", tag_lookup(http_code=404))
+chk("500 → unknown（查不清，不挡）",
+    tag_lookup(http_code=500) == "unknown", tag_lookup(http_code=500))
+chk("轻量标签 → 返回 commit sha",
+    tag_lookup({"object": {"type": "commit", "sha": HEAD}}) == HEAD)
+chk("附注标签 → unknown（sha 是 tag 对象，比了只会误伤）",
+    tag_lookup({"object": {"type": "tag", "sha": HEAD}}) == "unknown",
+    tag_lookup({"object": {"type": "tag", "sha": HEAD}}))
+chk("响应里没有 object → unknown", tag_lookup({}) == "unknown")
+chk("断网 → unknown", tag_lookup(raises=OSError("no net")) == "unknown")
 
 print()
 print("%d passed, %d failed" % (ok, fail))
