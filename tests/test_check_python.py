@@ -11,6 +11,7 @@ install 绿灯、start 只查 import PySide6（旧环境装着就过），README
 """
 import io
 import os
+import re
 import subprocess
 import sys
 
@@ -178,6 +179,48 @@ if os.name == "nt":
     _src = io.open(HELPER, encoding="utf-8").read()
     chk("helper 在 Windows 上用 list2cmdline 拼（不是裸 join）",
         "subprocess.list2cmdline(cmd)" in _src)
+
+print("== .bat 必须纯 ASCII + CRLF，块里的 echo 不能有裸括号 ==")
+# 2026-09-27 真事故：两个坑各废掉一整个版本。
+#
+# 1) start.bat 第 21 行 `echo      (do not copy only part of the folder).`
+#    躺在一个 if 块里。cmd 把 ( 读成嵌套块开始、) 读成块结束，多出来的那个
+#    . 就成了意外 token —— 报「此时不应有 .」。这是**解析期**错误，跟 if
+#    条件成立与否无关：文件里只要有这一行，start.bat 就 100% 起不来，
+#    表现为双击后毫无反应、也没有任何日志。v2.1.8 / v2.1.9 的便携包就是
+#    这么废掉的（已发布出去才发现）。
+#
+# 2) 中文 rem 注释：bat 存的是 UTF-8，cmd 按 GBK 单字节解析，多字节序列会
+#    啃掉紧跟在后面的 ASCII 字符 —— README 被啃成 EADME 然后当命令执行。
+#
+# 真跑 start.bat 会在失败分支撞上 pause 把测试挂住，所以这里做静态断言。
+for _n in ("start.bat", "install.bat"):
+    _raw = io.open(os.path.join(ROOT, _n), "rb").read()
+    chk("%s 全是 CRLF（cmd 只认 CRLF）" % _n,
+        _raw.count(b"\r\n") == _raw.count(b"\n"),
+        "CRLF=%d LF=%d" % (_raw.count(b"\r\n"), _raw.count(b"\n")))
+    chk("%s 纯 ASCII（中文注释会被 cmd 按 GBK 啃掉相邻字符）" % _n,
+        not any(b >= 0x80 for b in _raw),
+        [i for i, ln in enumerate(_raw.split(b"\r\n"), 1)
+         if any(b >= 0x80 for b in ln)])
+    _depth, _bad = 0, []
+    for _i, _l in enumerate(_raw.split(b"\r\n"), 1):
+        _s = _l.decode("utf-8", errors="replace")
+        _t = _s.strip()
+        if not _t or _t.lower().startswith("rem"):
+            continue
+        if (_depth > 0 and _t.lower().startswith("echo")
+                and ("(" in _t or ")" in _t)):
+            _bad.append(_i)
+        for _ch in re.sub(r"\^.", "", _s):      # ^( 这种转义过的不算裸括号
+            if _ch == "(":
+                _depth += 1
+            elif _ch == ")":
+                _depth -= 1
+        if _depth < 0:
+            _depth = 0
+    chk("%s 块内的 echo 没有裸括号" % _n, not _bad, _bad)
+    chk("%s 括号是配平的" % _n, _depth == 0, _depth)
 
 print()
 print("%d passed, %d failed" % (ok, fail))

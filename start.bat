@@ -18,7 +18,7 @@ if exist "%~dp0py\pythonw.exe" (
     echo Details:/r/n    "%~dp0py\python.exe" -c "import PySide6, providers, market_clock"
     echo.
     echo Fix: re-download the portable zip and extract it COMPLETELY
-    echo      (do not copy only part of the folder).
+    echo      do not copy only part of the folder.
     echo.
     pause
     exit /b 1
@@ -68,9 +68,9 @@ if defined PYFINDER (
     set "PYMAX=%%B"
   )
 )
-rem 兜底：cmd 不会做 shell 命令替换。如果前面的 for /f 没赋值成功，
-rem 错误信息就会变成 "needs see - tools\check_python.py --range"（真出过）。
-rem 这里给个与 README 一致的兜底字符串。
+rem Fallback: cmd does no shell substitution, so if the for /f above failed
+rem to assign, the message would read  needs see - check_python.py --range .
+rem Keep these numbers in sync with the range documented in the README.
 if not defined PYMIN set "PYMIN=3.10"
 if not defined PYMAX set "PYMAX=3.14"
 "%PYEXE%" "%~dp0tools\check_python.py"

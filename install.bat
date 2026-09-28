@@ -38,10 +38,10 @@ if defined PYFINDER (
     set "PYMAX=%%B"
   )
 )
-rem 兜底：cmd 不会做 shell 命令替换，"set "PYMAX=tools\check_python.py --range""
-rem 只是把字面字符串赋给 PYMAX，所以如果前面的 for /f 没赋值成功，错误信息
-rem 会变成 "needs see - tools\check_python.py --range"（之前真出过）。
-rem 这里给个与 README 一致的兜底字符串。
+rem Fallback: cmd does no shell substitution, so a line that looks like
+rem set PYMAX=tools\check_python.py --range would only assign a literal string.
+rem If the for /f above failed, the message would read  needs see - ...  -- once seen.
+rem Keep these numbers in sync with the range documented in the README.
 if not defined PYMIN set "PYMIN=3.10"
 if not defined PYMAX set "PYMAX=3.14"
 
@@ -101,13 +101,13 @@ if errorlevel 1 (
   echo FAILED: this .venv uses an unsupported Python version.
   echo          This project needs Python %PYMIN% - %PYMAX%.
   echo.
-  echo To fix it (three steps, about one minute):
+  echo To fix it -- three steps, about one minute:
   echo   1. Close this window.
   echo   2. Delete the ".venv" folder in this directory.
   echo   3. Double-click install.bat again.
   echo.
   echo Nothing else is touched: stocks.json, backups and logs all stay as they are.
-  echo (The old .venv is not deleted automatically -- that is your call.)
+  echo The old .venv is not deleted automatically -- that decision is yours.
   pause
   exit /b 1
 )
